@@ -6837,7 +6837,7 @@ public void start() throws UnavailableException {
 ### 4. Broker Client 接口实现
 
 在前面的章节中，已经分析了 Pulsar Client 以及相关的 Producer 和 Consumer ，接下来的接口分析就按照原来的
-思路，即按照消息发送、消息消费两个核心展开，以时序来依次分析其方法调用，然后再分析其特性
+思路，即按照消息发送、消息消费两个核心展开，以时序来依次分析其方法调用，然后再分析其特性。
 
 #### 1. 公共方法实现
 
@@ -9287,6 +9287,8 @@ public void startSendOperation() {
     }
 }
 
+//=================================================================================================================
+//以下是持久化消息逻辑
 public void publishMessage(long producerId, long sequenceId, ByteBuf headersAndPayload, long batchSize) {
     // 生产者被关闭了，直接发送错误信息
     if (isClosed) {
@@ -10100,9 +10102,490 @@ void notifyEntriesAvailable() {
         }
     }
 }
+
+//================================================================================================================
+// 非持久化消息处理逻辑
+
+public void publishMessage(ByteBuf data, PublishContext callback) {
+    // 这里就执行回调成功了
+    callback.completed(null, 0L, 0L);
+    ENTRIES_ADDED_COUNTER_UPDATER.incrementAndGet(this);
+    // 这里直接订阅分发逻辑
+    subscriptions.forEach((name, subscription) -> {
+        ByteBuf duplicateBuffer = data.retainedDuplicate();
+        Entry entry = create(0L, 0L, duplicateBuffer);
+        // 消息内部也会 retain 数据，所以，这里 duplicateBuffer 应该释放
+        duplicateBuffer.release();
+        if (subscription.getDispatcher() != null) {
+            subscription.getDispatcher().sendMessages(Collections.singletonList(entry));
+        } else {
+            //它在创建订阅时但是未创建分发者，消费者也还没新增完成。
+            entry.release();
+        }
+    });
+    // 如果副本复制器不为空，则直接往副本发送消息
+    if (!replicators.isEmpty()) {
+        replicators.forEach((name, replicator) -> {
+            ByteBuf duplicateBuffer = data.retainedDuplicate();
+            Entry entry = create(0L, 0L, duplicateBuffer);
+            // 消息内部也会 retain 数据，所以，这里 duplicateBuffer 应该释放
+            duplicateBuffer.release();
+            ((NonPersistentReplicator) replicator).sendMessage(entry);
+        });
+    }
+}
+
+// 单活消费者，非持久化分发器实现。
+public void sendMessages(List<Entry> entries) {
+    Consumer currentConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+    if (currentConsumer != null && currentConsumer.getAvailablePermits() > 0 && currentConsumer.isWritable()) {
+        // 推送消息
+        currentConsumer.sendMessages(entries);
+    } else {
+        // 这里因为没有存活消费者，记录消息被删除的事件
+        entries.forEach(entry -> {
+            int totalMsgs = getBatchSizeforEntry(entry.getDataBuffer(), subscription, -1);
+            if (totalMsgs > 0) {
+                msgDrop.recordEvent();
+            }
+            entry.release();
+        });
+    }
+}
+
+// 多活消费者，非持久化分发器实现，这里与单活消费者实现只是多了一个选择消费者的过程。
+// 其中，优先级0为最高优先级，1,2。。依次类推
+public void sendMessages(List<Entry> entries) {
+    Consumer consumer = TOTAL_AVAILABLE_PERMITS_UPDATER.get(this) > 0 ? getNextConsumer() : null;
+    if (consumer != null) {
+        TOTAL_AVAILABLE_PERMITS_UPDATER.addAndGet(this, -consumer.sendMessages(entries).getTotalSentMessages());
+    } else {
+        entries.forEach(entry -> {
+            int totalMsgs = getBatchSizeforEntry(entry.getDataBuffer(), subscription, -1);
+            if (totalMsgs > 0) {
+                msgDrop.recordEvent();
+            }
+            entry.release();
+        });
+    }
+}
+
+public Consumer getNextConsumer() {
+    if (consumerList.isEmpty() || IS_CLOSED_UPDATER.get(this) == TRUE) {
+        // 如果没有消费者连接或者分发器已关闭，则直接返回
+        return null;
+    }
+    // 如果当前消费者轮询索引大于等于消费者数，则赋值0
+    if (currentConsumerRoundRobinIndex >= consumerList.size()) {
+        currentConsumerRoundRobinIndex = 0;
+    }
+
+    // 获取当前索引对应的消费者优先级
+    int currentRoundRobinConsumerPriority = consumerList.get(currentConsumerRoundRobinIndex).getPriorityLevel();
+
+    //如果currentIndex不在最高级别0，则在更高级别找到可用消费者
+    if (currentRoundRobinConsumerPriority != 0) {
+        int higherPriorityConsumerIndex = getConsumerFromHigherPriority(currentRoundRobinConsumerPriority);
+        if (higherPriorityConsumerIndex != -1) {
+            currentConsumerRoundRobinIndex = higherPriorityConsumerIndex + 1;
+            return consumerList.get(higherPriorityConsumerIndex);
+        }
+    }
+
+    // currentIndex已经处于最高级别或者无法在更高级别找到消费者，因此，找到相同或更低级别的消费者
+    int availableConsumerIndex = getNextConsumerFromSameOrLowerLevel(currentConsumerRoundRobinIndex);
+    if (availableConsumerIndex != -1) {
+        currentConsumerRoundRobinIndex = availableConsumerIndex + 1;
+        return consumerList.get(availableConsumerIndex);
+    }
+
+    // 没有找到可用消费者
+    return null;
+}
+
+// 找出更高的优先级的消费者
+private int getConsumerFromHigherPriority(int targetPriority) {
+    for (int i = 0; i < currentConsumerRoundRobinIndex; i++) {
+        Consumer consumer = consumerList.get(i);
+        if (consumer.getPriorityLevel() < targetPriority) {
+            if (isConsumerAvailable(consumerList.get(i))) {
+                return i;
+            }
+        } else {
+            break;
+        }
+    }
+    return -1;
+}
+
+// 找到下一个消费者，相同级别或更低级别
+private int getNextConsumerFromSameOrLowerLevel(int currentRoundRobinIndex) {
+
+    int targetPriority = consumerList.get(currentRoundRobinIndex).getPriorityLevel();
+    // 如果无法从currentRR中找到消费者到列表中的最后消费者，则使用轮询找
+    int scanIndex = currentRoundRobinIndex;
+    int endPriorityLevelIndex = currentRoundRobinIndex;
+    do {
+        Consumer scanConsumer = scanIndex < consumerList.size() ? consumerList.get(scanIndex) : null /* 表明列表中已到末尾 */;
+
+        // 如果到达列表的最后一个使用者，则从头开始检查列表的currentRRIndex
+        if (scanConsumer == null || scanConsumer.getPriorityLevel() != targetPriority) {
+            endPriorityLevelIndex = scanIndex;
+            scanIndex = getFirstConsumerIndexOfPriority(targetPriority);
+        } else {
+            if (isConsumerAvailable(scanConsumer)) {
+                return scanIndex;
+            }
+            scanIndex++;
+        }
+    } while (scanIndex != currentRoundRobinIndex);
+
+    // 这意味着，在同一级别下没有找到消费者，所以，找比这个级别更低的可用消费者
+    for (int i = endPriorityLevelIndex; i < consumerList.size(); i++) {
+        if (isConsumerAvailable(consumerList.get(i))) {
+            return i;
+        }
+    }
+
+    return -1;
+}
 ```
 
+到这里，发送消息的流程基本结束，这里回顾一下总体流程：
+
+1. 校验生产者是否已准备好
+2. 校验消息的校验和（可选）
+3. 校验消息加密（可选）
+4. 持久化消息发送逻辑
+   1. 消息去重（可选）
+   2. ledger 的状态机处理，如果 ledger 的状态为关闭，则创建新的ledger ，如果为打开状态，则判定当前ledger是否已满，设置新增消息完成后关闭ledger标志，并执行消息添加操作。
+   3. 消息添加操作执行完后，开始执行回调。如果添加失败，根据状态会把当前ledger的状态设置为关闭或清空等待队列，并执行如下操作：
+       1. 检查游标，找出已全部消费的 ledger 列表，然后检查是否已过期，是否超过空间大小配额，形成新的 ledger 列表，准备异步卸载（归档）。
+       2. 检查所有的 ledger ，确定已经被卸载的ledger （一般是放入云存储里），准备异步删除。
+       3. 更新 ledger 元数据，如果成功，则执行步骤4的新的 ledger 列表，依次异步卸载，步骤5中的新的 ledger 列表异步删除。
+       4. 检查所有的 ledger，根据 ledger 的元数据配置，判定是否需要卸载，以及叠加卸载的大小，是否达到卸载自动触发大小阈值，如果达到，则把更久远的 ledger 放入待卸载
+       ledger 列表，根据新产生的 ledger 列表，更新 ledger 元数据，并执行卸载操作，如果成功，则更新到原数据，继续重复动作，直到列表为空。如果失败，则删除相关资源（主要是元存储上的资源）。
+       5. 如果新增消息等待队列不为空，则创建新的 ledger 。
+   4. 如果添加成功，检查是否完成超时，超时则直接返回，否则如下操作：
+       1. 如果有存活游标，则放入消息缓存。
+       2. 更新消息计数，并更新最后确认消息。
+       3. 如果设置了执行完后关闭标志，则异步关闭当前ledger。
+       4. 通知所有游标消息到来。
+5. 非持久化消息发送逻辑
+   1. 执行回调，表示发送成功
+   2. 通过订阅关系，获取分发器，分发器发送消息出去。（这里分发器有2个实现，单活非持久性分发器、多活非持久性分发器，他们最大区别在于后者支持多个存活消费者，并且支持消费者优先级）
+      1. 获取消费者，如果消费者不为空，则推送消息
+      2. 如果消费者为空，则触发消息丢弃事件
+   3. 如果副本复制器不为空，则也发送消息到远程副本。
+
+好了，消息发送完后，这时候，需要关闭生产者，那么情况下一小结，handleCloseProducer 命令实现。
+
+##### 4. handleCloseProducer 命令实现
+
+```java
+
+protected void handleCloseProducer(CommandCloseProducer closeProducer) {
+    // 状态检查
+    checkArgument(state == State.Connected);
+
+    final long producerId = closeProducer.getProducerId();
+    final long requestId = closeProducer.getRequestId();
+    // 未找到相关生产者信息，未知错误
+    CompletableFuture<Producer> producerFuture = producers.get(producerId);
+    if (producerFuture == null) {
+        log.warn("[{}] Producer {} was not registered on the connection", remoteAddress, producerId);
+        ctx.writeAndFlush(Commands.newError(requestId, ServerError.UnknownError,
+                "Producer was not registered on the connection"));
+        return;
+    }
+    // 在创建之前关闭生产者
+    if (!producerFuture.isDone() && producerFuture
+            .completeExceptionally(new IllegalStateException("Closed producer before creation was complete"))) {
+        //收到了在生产者（创建）实际完成之前关闭生产者的请求，已将生产者标记为失败，
+        //可以告诉客户关闭操作成功。 当实际的创建操作完成时，新生产者将被丢弃。
+        log.info("[{}] Closed producer {} before its creation was completed", remoteAddress, producerId);
+        ctx.writeAndFlush(Commands.newSuccess(requestId));
+        return;
+    } else if (producerFuture.isCompletedExceptionally()) {
+        // 生产者本身没有创建成功，但是可以认为关闭成功
+        log.info("[{}] Closed producer {} that already failed to be created", remoteAddress, producerId);
+        ctx.writeAndFlush(Commands.newSuccess(requestId));
+        return;
+    }
+
+    // 正常关闭生产者
+    Producer producer = producerFuture.getNow(null);
+    log.info("[{}][{}] Closing producer on cnx {}", producer.getTopic(), producer.getProducerName(), remoteAddress);
+
+    producer.close().thenAccept(v -> {
+        log.info("[{}][{}] Closed producer on cnx {}", producer.getTopic(), producer.getProducerName(),
+                remoteAddress);
+        ctx.writeAndFlush(Commands.newSuccess(requestId));
+        producers.remove(producerId, producerFuture);
+    });
+}
+
+public synchronized CompletableFuture<Void> close() {
+    if (log.isDebugEnabled()) {
+        log.debug("Closing producer {} -- isClosed={}", this, isClosed);
+    }
+    // 如果关闭标记为false
+    if (!isClosed) {
+        isClosed = true;
+        if (log.isDebugEnabled()) {
+            log.debug("Trying to close producer {} -- cnxIsActive: {} -- pendingPublishAcks: {}", this,
+                    cnx.isActive(), pendingPublishAcks);
+        }
+        // 如果通道不在活动或发布确认等待数为0，则现在关闭
+        if (!cnx.isActive() || pendingPublishAcks == 0) {
+            closeNow();
+        }
+    }
+    return closeFuture;
+}
+
+//清理资源
+void closeNow() {
+    topic.removeProducer(this);
+    cnx.removedProducer(this);
+
+    if (log.isDebugEnabled()) {
+        log.debug("Removed producer: {}", this);
+    }
+    closeFuture.complete(null);
+}
+
+```
+
+关闭生产者命令还是非常简单，简单的判断和清理资源，即完成。
+
+下面，总结下，producer 与 broker 的交互过程：
+
+1. 指定 service_url ，与 broker 或 proxy 建立连接
+2. 通过`GET_SCHEMA`命令,获取 schema 信息
+3. 通过`PARTITIONED_METADATA`命令,获取 partitionedTopicMetadata 信息
+4. 通过`LOOKUP`命令,获取存活的 broker 或 proxy address 信息
+5. 与（重定向）新的 broker 或 proxy 建立连接，通道激活后，发送 `CONNECT` 命令
+6. 连接成功后，发送消息用 `PRODUCER` 命令
+7. 在 broker 上注册 producer 后，就可以发送消息了，发送消息用 `Send` 命令
+8. 消息发送完毕后，关闭生产者，发送`CLOSE_PRODUCER`命令
+
+整个交互逻辑即完成。那么目前为止，broker 的生产者接口实现已全部交代完毕。
+
+接下来，将讲解消费者的在 broker 端实现。
+
 #### 3. Broker Consumer 接口实现
+
+这里，可以复习下，消费者是怎么启动，并消费消息的。
+跟生产者一样，消费者 与 broker 交互时，刚开始也遵循如下操作：
+
+1. 指定 service url ，与 broker 或 proxy 建立连接
+2. 通过`GET_SCHEMA`命令,获取 schema 信息
+3. 通过`PARTITIONED_METADATA`命令,获取 partitionedTopicMetadata 信息
+4. 通过`LOOKUP`命令,获取存活的 broker 或 proxy address 信息
+5. 与（重定向）新的 broker 或 proxy 建立连接，通道激活后，发送 `CONNECT` 命令
+6. 连接成功后，发送消息用 `SUBSCRIBE` 命令
+
+##### 1. handleSubscribe 命令实现
+
+```java
+
+protected void handleSubscribe(final CommandSubscribe subscribe) {
+    // 类似于生产者，处理完 Connect 命令后，通道状态应该为 已连接 状态
+    checkArgument(state == State.Connected);
+    final long requestId = subscribe.getRequestId();
+    final long consumerId = subscribe.getConsumerId();
+    // 校验 Topic 合法性
+    TopicName topicName = validateTopicName(subscribe.getTopic(), requestId, subscribe);
+    if (topicName == null) {
+        return;
+    }
+    // 如果认证与授权被启用时，当连接时候，如果认证角色（authRole）是代理角色（proxyRoles）之一时，必须强制如下规则
+    // * originalPrincipal 不能为空
+    // * originalPrincipal 不能是以 proxy 身份
+    // 这里跟生产者一致
+    if (invalidOriginalPrincipal(originalPrincipal)) {
+        final String msg = "Valid Proxy Client role should be provided while subscribing ";
+        log.warn("[{}] {} with role {} and proxyClientAuthRole {} on topic {}", remoteAddress, msg, authRole,
+                originalPrincipal, topicName);
+        ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, msg));
+        return;
+    }
+
+    final String subscriptionName = subscribe.getSubscription();
+    final SubType subType = subscribe.getSubType();
+    final String consumerName = subscribe.getConsumerName();
+    final boolean isDurable = subscribe.getDurable();
+    final MessageIdImpl startMessageId = subscribe.hasStartMessageId() ? new BatchMessageIdImpl(
+            subscribe.getStartMessageId().getLedgerId(), subscribe.getStartMessageId().getEntryId(),
+            subscribe.getStartMessageId().getPartition(), subscribe.getStartMessageId().getBatchIndex())
+            : null;
+    final String subscription = subscribe.getSubscription();
+    final int priorityLevel = subscribe.hasPriorityLevel() ? subscribe.getPriorityLevel() : 0;
+    final boolean readCompacted = subscribe.getReadCompacted();
+    final Map<String, String> metadata = CommandUtils.metadataFromCommand(subscribe);
+    final InitialPosition initialPosition = subscribe.getInitialPosition();
+    final SchemaData schema = subscribe.hasSchema() ? getSchema(subscribe.getSchema()) : null;
+
+    CompletableFuture<Boolean> isProxyAuthorizedFuture;
+    if (service.isAuthorizationEnabled() && originalPrincipal != null) {
+        isProxyAuthorizedFuture = service.getAuthorizationService().canConsumeAsync(topicName, authRole,
+                authenticationData, subscribe.getSubscription());
+    } else {
+        isProxyAuthorizedFuture = CompletableFuture.completedFuture(true);
+    }
+    isProxyAuthorizedFuture.thenApply(isProxyAuthorized -> {
+        if (isProxyAuthorized) {
+            CompletableFuture<Boolean> authorizationFuture;
+            if (service.isAuthorizationEnabled()) {
+                authorizationFuture = service.getAuthorizationService().canConsumeAsync(topicName,
+                        originalPrincipal != null ? originalPrincipal : authRole, authenticationData,
+                        subscription);
+            } else {
+                authorizationFuture = CompletableFuture.completedFuture(true);
+            }
+
+            authorizationFuture.thenApply(isAuthorized -> {
+                if (isAuthorized) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}] Client is authorized to subscribe with role {}", remoteAddress, authRole);
+                    }
+
+                    log.info("[{}] Subscribing on topic {} / {}", remoteAddress, topicName, subscriptionName);
+                    try {
+                        Metadata.validateMetadata(metadata);
+                    } catch (IllegalArgumentException iae) {
+                        final String msg = iae.getMessage();
+                        ctx.writeAndFlush(Commands.newError(requestId, ServerError.MetadataError, msg));
+                        return null;
+                    }
+                    CompletableFuture<Consumer> consumerFuture = new CompletableFuture<>();
+                    CompletableFuture<Consumer> existingConsumerFuture = consumers.putIfAbsent(consumerId,
+                            consumerFuture);
+
+                    if (existingConsumerFuture != null) {
+                        if (existingConsumerFuture.isDone() && !existingConsumerFuture.isCompletedExceptionally()) {
+                            Consumer consumer = existingConsumerFuture.getNow(null);
+                            log.info("[{}] Consumer with the same id is already created: {}", remoteAddress,
+                                    consumer);
+                            ctx.writeAndFlush(Commands.newSuccess(requestId));
+                            return null;
+                        } else {
+                            // There was an early request to create a consumer with same consumerId. This can happen
+                            // when
+                            // client timeout is lower the broker timeouts. We need to wait until the previous
+                            // consumer
+                            // creation request either complete or fails.
+                            log.warn("[{}][{}][{}] Consumer is already present on the connection", remoteAddress,
+                                    topicName, subscriptionName);
+                            ServerError error = !existingConsumerFuture.isDone() ? ServerError.ServiceNotReady
+                                    : getErrorCode(existingConsumerFuture);
+                            ctx.writeAndFlush(Commands.newError(requestId, error,
+                                    "Consumer is already present on the connection"));
+                            return null;
+                        }
+                    }
+
+                    service.getOrCreateTopic(topicName.toString())
+                            .thenCompose(topic -> {
+                                if (schema != null) {
+                                    return topic.addSchemaIfIdleOrCheckCompatible(schema)
+                                        .thenCompose(isCompatible -> {
+                                                if (isCompatible) {
+                                                    return topic.subscribe(ServerCnx.this, subscriptionName, consumerId,
+                                                            subType, priorityLevel, consumerName, isDurable,
+                                                            startMessageId, metadata,
+                                                            readCompacted, initialPosition);
+                                                } else {
+                                                    return FutureUtil.failedFuture(
+                                                            new IncompatibleSchemaException(
+                                                                    "Trying to subscribe with incompatible schema"
+                                                    ));
+                                                }
+                                            });
+                                } else {
+                                    return topic.subscribe(ServerCnx.this, subscriptionName, consumerId,
+                                        subType, priorityLevel, consumerName, isDurable,
+                                        startMessageId, metadata, readCompacted, initialPosition);
+                                }
+                            })
+                            .thenAccept(consumer -> {
+                                if (consumerFuture.complete(consumer)) {
+                                    log.info("[{}] Created subscription on topic {} / {}", remoteAddress, topicName,
+                                            subscriptionName);
+                                    ctx.writeAndFlush(Commands.newSuccess(requestId), ctx.voidPromise());
+                                } else {
+                                    // The consumer future was completed before by a close command
+                                    try {
+                                        consumer.close();
+                                        log.info("[{}] Cleared consumer created after timeout on client side {}",
+                                                remoteAddress, consumer);
+                                    } catch (BrokerServiceException e) {
+                                        log.warn(
+                                                "[{}] Error closing consumer created after timeout on client side {}: {}",
+                                                remoteAddress, consumer, e.getMessage());
+                                    }
+                                    consumers.remove(consumerId, consumerFuture);
+                                }
+
+                            }) //
+                            .exceptionally(exception -> {
+                                if (exception.getCause() instanceof ConsumerBusyException) {
+                                    if (log.isDebugEnabled()) {
+                                        log.debug(
+                                                "[{}][{}][{}] Failed to create consumer because exclusive consumer is already connected: {}",
+                                                remoteAddress, topicName, subscriptionName,
+                                                exception.getCause().getMessage());
+                                    }
+                                } else {
+                                    log.warn("[{}][{}][{}] Failed to create consumer: {}", remoteAddress, topicName,
+                                            subscriptionName, exception.getCause().getMessage(), exception);
+                                }
+
+                                // If client timed out, the future would have been completed by subsequent close.
+                                // Send error
+                                // back to client, only if not completed already.
+                                if (consumerFuture.completeExceptionally(exception)) {
+                                    ctx.writeAndFlush(Commands.newError(requestId,
+                                            BrokerServiceException.getClientErrorCode(exception.getCause()),
+                                            exception.getCause().getMessage()));
+                                }
+                                consumers.remove(consumerId, consumerFuture);
+
+                                return null;
+
+                            });
+                } else {
+                    String msg = "Client is not authorized to subscribe";
+                    log.warn("[{}] {} with role {}", remoteAddress, msg, authRole);
+                    ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, msg));
+                }
+                return null;
+            }).exceptionally(e -> {
+                String msg = String.format("[%s] %s with role %s", remoteAddress, e.getMessage(), authRole);
+                log.warn(msg);
+                ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, e.getMessage()));
+                return null;
+            });
+        } else {
+            final String msg = "Proxy Client is not authorized to subscribe";
+            log.warn("[{}] {} with role {} on topic {}", remoteAddress, msg, authRole, topicName);
+            ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, msg));
+        }
+        return null;
+    }).exceptionally(ex -> {
+        String msg = String.format("[%s] %s with role %s", remoteAddress, ex.getMessage(), authRole);
+        if (ex.getCause() instanceof PulsarServerException) {
+            log.info(msg);
+        } else {
+            log.warn(msg);
+        }
+        ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, ex.getMessage()));
+        return null;
+    });
+}
+
+```
 
 ### 6. Broker admin 接口实现
 
