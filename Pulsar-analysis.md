@@ -2728,7 +2728,7 @@ public CompletableFuture<List<String>> getPartitionsForTopic(String topic) {
 
 ```
 
-到这里，Pulsar Producer 已经解析完毕，架构上跟传统的MQ Producer 的职责一样，但是在源代码上实现还是非常优雅的，层次非常鲜明，代码模式用的恰大好处，很容易阅读。
+到这里，Pulsar Producer 已经解析完毕，架构上跟传统的MQ Producer 的职责一样，但是在源代码上实现还是非常优雅的，层次非常鲜明，设计模式用的恰大好处，很容易阅读。
 
 ## Pulsar Consumer源码解析
 
@@ -10361,14 +10361,14 @@ void closeNow() {
 
 下面，总结下，producer 与 broker 的交互过程：
 
-1. 指定 service_url ，与 broker 或 proxy 建立连接
-2. 通过`GET_SCHEMA`命令,获取 schema 信息
-3. 通过`PARTITIONED_METADATA`命令,获取 partitionedTopicMetadata 信息
-4. 通过`LOOKUP`命令,获取存活的 broker 或 proxy address 信息
-5. 与（重定向）新的 broker 或 proxy 建立连接，通道激活后，发送 `CONNECT` 命令
-6. 连接成功后，发送消息用 `PRODUCER` 命令
-7. 在 broker 上注册 producer 后，就可以发送消息了，发送消息用 `Send` 命令
-8. 消息发送完毕后，关闭生产者，发送`CLOSE_PRODUCER`命令
+1. 指定 service_url ，与 broker 或 proxy 建立连接。
+2. 通过`GET_SCHEMA`命令,获取 schema 信息。
+3. 通过`PARTITIONED_METADATA`命令,获取 partitionedTopicMetadata 信息。
+4. 通过`LOOKUP`命令,获取存活的 broker 或 proxy address 信息。
+5. 与（重定向）新的 broker 或 proxy 建立连接，通道激活后，发送 `CONNECT` 命令。
+6. 连接成功后，发送消息用 `PRODUCER` 命令。
+7. 在 broker 上注册 producer 后，就可以发送消息了，发送消息用 `Send` 命令。
+8. 消息发送完毕后，关闭生产者，发送`CLOSE_PRODUCER`命令。
 
 整个交互逻辑即完成。那么目前为止，broker 的生产者接口实现已全部交代完毕。
 
@@ -10376,15 +10376,18 @@ void closeNow() {
 
 #### 3. Broker Consumer 接口实现
 
-这里，可以复习下，消费者是怎么启动，并消费消息的。
+这里，可以复习下，消费者是怎么启动，并怎么消费消息。
+
 跟生产者一样，消费者 与 broker 交互时，刚开始也遵循如下操作：
 
-1. 指定 service url ，与 broker 或 proxy 建立连接
-2. 通过`GET_SCHEMA`命令,获取 schema 信息
-3. 通过`PARTITIONED_METADATA`命令,获取 partitionedTopicMetadata 信息
-4. 通过`LOOKUP`命令,获取存活的 broker 或 proxy address 信息
-5. 与（重定向）新的 broker 或 proxy 建立连接，通道激活后，发送 `CONNECT` 命令
-6. 连接成功后，发送消息用 `SUBSCRIBE` 命令
+1. 指定 service url ，与 broker 或 proxy 建立连接。
+2. 通过`GET_SCHEMA`命令,获取 schema 信息。
+3. 通过`PARTITIONED_METADATA`命令,获取 partitionedTopicMetadata 信息。
+4. 通过`LOOKUP`命令,获取存活的 broker 或 proxy address 信息。
+5. 与（重定向）新的 broker 或 proxy 建立连接，通道激活后，发送 `CONNECT` 命令。
+6. 连接成功后，发送消息用 `SUBSCRIBE` 命令。
+
+因为消费者在订阅之前，其与 broker 交互流程基本一样，这里不再赘述。下面，开始讲消费者的消费流程
 
 ##### 1. handleSubscribe 命令实现
 
@@ -10444,7 +10447,7 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
             } else {
                 authorizationFuture = CompletableFuture.completedFuture(true);
             }
-
+            // 认证过程跟生产者完全一致，这里不再赘述
             authorizationFuture.thenApply(isAuthorized -> {
                 if (isAuthorized) {
                     if (log.isDebugEnabled()) {
@@ -10453,6 +10456,7 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
 
                     log.info("[{}] Subscribing on topic {} / {}", remoteAddress, topicName, subscriptionName);
                     try {
+                        // 校验元数据合法性，主要是数据大小不超过1Kb
                         Metadata.validateMetadata(metadata);
                     } catch (IllegalArgumentException iae) {
                         final String msg = iae.getMessage();
@@ -10460,10 +10464,12 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
                         return null;
                     }
                     CompletableFuture<Consumer> consumerFuture = new CompletableFuture<>();
+                    // 根据消费者ID来判断消费者是否之前已存在，这里出现的情况是可能重试导致的
                     CompletableFuture<Consumer> existingConsumerFuture = consumers.putIfAbsent(consumerId,
                             consumerFuture);
-
+                    // 不为空的时
                     if (existingConsumerFuture != null) {
+                         // 已完成，并且无异常，这里认为之前创建的消费者是成功的，故直接返回成功
                         if (existingConsumerFuture.isDone() && !existingConsumerFuture.isCompletedExceptionally()) {
                             Consumer consumer = existingConsumerFuture.getNow(null);
                             log.info("[{}] Consumer with the same id is already created: {}", remoteAddress,
@@ -10471,11 +10477,7 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
                             ctx.writeAndFlush(Commands.newSuccess(requestId));
                             return null;
                         } else {
-                            // There was an early request to create a consumer with same consumerId. This can happen
-                            // when
-                            // client timeout is lower the broker timeouts. We need to wait until the previous
-                            // consumer
-                            // creation request either complete or fails.
+                            // 早期请求创建具有相同 consumerId 的消费者。 当客户端设置的超时时间低于 broker 本身处理的超时时间，可能会发生这种情况。 这时候，需要等到上一个消费者创建请求完成或失败，返回客户端异常，表示消费者正在连接中。
                             log.warn("[{}][{}][{}] Consumer is already present on the connection", remoteAddress,
                                     topicName, subscriptionName);
                             ServerError error = !existingConsumerFuture.isDone() ? ServerError.ServiceNotReady
@@ -10485,18 +10487,21 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
                             return null;
                         }
                     }
-
+                    // 这里生产者已经分析过，不再赘述
                     service.getOrCreateTopic(topicName.toString())
                             .thenCompose(topic -> {
-                                if (schema != null) {
+                                if (schema != null) { 
+                                    //schema 不为空，如果 topic 空闲（即无生产者，无消息，无生产者，不存在 schema），则新增 schema 信息，否则检查兼容性
                                     return topic.addSchemaIfIdleOrCheckCompatible(schema)
                                         .thenCompose(isCompatible -> {
+                                                // 兼容
                                                 if (isCompatible) {
                                                     return topic.subscribe(ServerCnx.this, subscriptionName, consumerId,
                                                             subType, priorityLevel, consumerName, isDurable,
                                                             startMessageId, metadata,
                                                             readCompacted, initialPosition);
                                                 } else {
+                                                    // 不兼容则抛异常：尝试订阅不兼容的 schema
                                                     return FutureUtil.failedFuture(
                                                             new IncompatibleSchemaException(
                                                                     "Trying to subscribe with incompatible schema"
@@ -10504,18 +10509,20 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
                                                 }
                                             });
                                 } else {
+                                    // schema 为空，也就是兼容传统MQ模式（Bytes）
                                     return topic.subscribe(ServerCnx.this, subscriptionName, consumerId,
                                         subType, priorityLevel, consumerName, isDurable,
                                         startMessageId, metadata, readCompacted, initialPosition);
                                 }
                             })
                             .thenAccept(consumer -> {
+                                // 尝试执行完成，如果成功，则发命令给客户端，表示订阅成功
                                 if (consumerFuture.complete(consumer)) {
                                     log.info("[{}] Created subscription on topic {} / {}", remoteAddress, topicName,
                                             subscriptionName);
                                     ctx.writeAndFlush(Commands.newSuccess(requestId), ctx.voidPromise());
                                 } else {
-                                    // The consumer future was completed before by a close command
+                                    // 如果失败，则关闭自己 （因为前面的 futrue 已经执行完成）（客户端方超时导致）
                                     try {
                                         consumer.close();
                                         log.info("[{}] Cleared consumer created after timeout on client side {}",
@@ -10530,6 +10537,7 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
 
                             }) //
                             .exceptionally(exception -> {
+                                // 消费者忙异常引起的
                                 if (exception.getCause() instanceof ConsumerBusyException) {
                                     if (log.isDebugEnabled()) {
                                         log.debug(
@@ -10542,14 +10550,13 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
                                             subscriptionName, exception.getCause().getMessage(), exception);
                                 }
 
-                                // If client timed out, the future would have been completed by subsequent close.
-                                // Send error
-                                // back to client, only if not completed already.
+                                // 如果客户端超时，futrue 可能已经被关闭，尝试 future 设置异常，如果成功，则发命令通知客户端，表示 broker 服务异常。
                                 if (consumerFuture.completeExceptionally(exception)) {
                                     ctx.writeAndFlush(Commands.newError(requestId,
                                             BrokerServiceException.getClientErrorCode(exception.getCause()),
                                             exception.getCause().getMessage()));
                                 }
+                                // 清理资源
                                 consumers.remove(consumerId, consumerFuture);
 
                                 return null;
@@ -10583,6 +10590,1034 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
         ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, ex.getMessage()));
         return null;
     });
+}
+
+
+// ============================持久化 Topic ===========================================//
+// 
+// PersistentTopic 类，用于判断 schema 不为空，如果 topic 空闲（即无生产者，无消息，无生产者，不存在 schema），则新增 schema 信息，否则检查兼容性
+public CompletableFuture<Boolean> addSchemaIfIdleOrCheckCompatible(SchemaData schema) {
+    return hasSchema()
+        .thenCompose((hasSchema) -> {
+                if (hasSchema || isActive() || ledger.getTotalSize() != 0) {
+                    // 兼容性检查
+                    return isSchemaCompatible(schema);
+                } else {
+                    // 新增 schema 操作
+                    return addSchema(schema).thenApply((ignore) -> true);
+                }
+            });
+}
+
+// 判定是否设置了 schema
+public CompletableFuture<Boolean> hasSchema() {
+    String base = TopicName.get(getName()).getPartitionedTopicName();
+    String id = TopicName.get(base).getSchemaName();
+    return brokerService.pulsar()
+        .getSchemaRegistryService()
+        .getSchema(id).thenApply((schema) -> schema != null);
+}
+
+public boolean isActive() {
+    if (TopicName.get(topic).isGlobal()) {
+        //如果是全局 Topic，如果有本地消费者 或 有本地生产者，那么当前 Topic 是活动的
+        return !subscriptions.isEmpty() || hasLocalProducers();
+    }
+    // 非全局 Topic 时，这里生产者计数不为0，或订阅不为空，则认为当前 Topic 是活动的
+    return USAGE_COUNT_UPDATER.get(this) != 0 || !subscriptions.isEmpty();
+}
+// 返回当前 Topic 消息数总大小
+public long getTotalSize() {
+    return TOTAL_SIZE_UPDATER.get(this);
+}
+// 新增 schema ，如果为空则直接返回 SchemaVersion.Empty ，否则保存到
+public CompletableFuture<SchemaVersion> addSchema(SchemaData schema) {
+    if (schema == null) {
+        return CompletableFuture.completedFuture(SchemaVersion.Empty);
+    }
+
+    String base = TopicName.get(getName()).getPartitionedTopicName();
+    String id = TopicName.get(base).getSchemaName();
+    return brokerService.pulsar()
+        .getSchemaRegistryService()
+        .putSchemaIfAbsent(id, schema, schemaCompatibilityStrategy);
+}
+
+// 如果没有则添加，否则直接返回存在的 schema 信息
+public CompletableFuture<SchemaVersion> putSchemaIfAbsent(String schemaId, SchemaData schema,
+                                                              SchemaCompatibilityStrategy strategy) {
+    return getSchema(schemaId)
+        .thenApply(
+            (existingSchema) ->
+                existingSchema == null //为空
+                    || existingSchema.schema.isDeleted()//已删除
+                    || isCompatible(existingSchema, schema, strategy))
+        .thenCompose(isCompatible -> {
+                if (isCompatible) {
+                    // 检查通过，注册新的 schema 信息
+                    byte[] context = hashFunction.hashBytes(schema.getData()).asBytes();
+                    SchemaRegistryFormat.SchemaInfo info = SchemaRegistryFormat.SchemaInfo.newBuilder()
+                        .setType(Functions.convertFromDomainType(schema.getType()))
+                        .setSchema(ByteString.copyFrom(schema.getData()))
+                        .setSchemaId(schemaId)
+                        .setUser(schema.getUser())
+                        .setDeleted(false)
+                        .setTimestamp(clock.millis())
+                        .addAllProps(toPairs(schema.getProps()))
+                        .build();
+                    return schemaStorage.put(schemaId, info.toByteArray(), context);
+                } else {
+                    // 检查失败，抛异常
+                    return FutureUtil.failedFuture(new IncompatibleSchemaException());
+                }
+            });
+}
+// 获取 schema 的最新版本
+public CompletableFuture<SchemaAndMetadata> getSchema(String schemaId) {
+    return getSchema(schemaId, SchemaVersion.Latest);
+}
+// 从 schemaStorage 获取到 schema 信息
+public CompletableFuture<SchemaAndMetadata> getSchema(String schemaId, SchemaVersion version) {
+    return schemaStorage.get(schemaId, version).thenCompose(stored -> {
+            // 如果为空，则直接返回null
+            if (isNull(stored)) {
+                return completedFuture(null);
+            } else {
+                // 否则，把字节数据转换成 SchemaInfo 
+                return Functions.bytesToSchemaInfo(stored.data)
+                    .thenApply(Functions::schemaInfoToSchema) //转换成 schemaData 
+                    // 转换成 schemaAndMetadata
+                    .thenApply(schema -> new SchemaAndMetadata(schemaId, schema, stored.version));
+            }
+        }
+    );
+}
+
+public CompletableFuture<StoredSchema> get(String key, SchemaVersion version) {
+    if (version == SchemaVersion.Latest) {
+        return getSchema(key);
+    } else {
+        LongSchemaVersion longVersion = (LongSchemaVersion) version;
+        return getSchema(key, longVersion.getVersion());
+    }
+}
+// 从存储中读取 storedSchema 信息
+private CompletableFuture<StoredSchema> getSchema(String schemaId) {
+    // 已经有一个 schema 读操作正在进行。
+    return readSchemaOperations.computeIfAbsent(schemaId, key -> {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Fetching schema from store", schemaId);
+        }
+        CompletableFuture<StoredSchema> future = new CompletableFuture<>();
+
+        getSchemaLocator(getSchemaPath(schemaId)).thenCompose(locator -> {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Got schema locator {}", schemaId, locator);
+            }
+            // 如果没有，则直接返回空
+            if (!locator.isPresent()) {
+                return completedFuture(null);
+            }
+
+            SchemaStorageFormat.SchemaLocator schemaLocator = locator.get().locator;
+            return readSchemaEntry(schemaLocator.getInfo().getPosition())
+                     // 这里就获取到 schema 数据 （这个存在 bookkeeper 里面）
+                    .thenApply(entry -> new StoredSchema(entry.getSchemaData().toByteArray(),
+                            // 这里就获取到 schema 版本数据 （这个是 zk 节点版本产生）
+                            new LongSchemaVersion(schemaLocator.getInfo().getVersion())));
+        }).handleAsync((res, ex) -> {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Get operation completed. res={} -- ex={}", schemaId, res, ex);
+            }
+
+            // 清理已处理的操作
+            readSchemaOperations.remove(schemaId, future);
+            if (ex != null) {
+                future.completeExceptionally(ex);
+            } else {
+                future.complete(res);
+            }
+            return null;
+        });
+
+        return future;
+    });
+}
+
+// 存储位置
+private static String getSchemaPath(String schemaId) {
+    return SchemaPath + "/" + schemaId;
+}
+
+// 从本地 zk 缓存中读取版本信息
+private CompletableFuture<Optional<LocatorEntry>> getSchemaLocator(String schema) {
+    return localZkCache.getEntryAsync(schema, new SchemaLocatorDeserializer()).thenApply(optional ->
+        optional.map(entry -> new LocatorEntry(entry.getKey(), entry.getValue().getVersion()))
+    );
+}
+
+ private CompletableFuture<SchemaStorageFormat.SchemaEntry> readSchemaEntry(
+        SchemaStorageFormat.PositionInfo position) {
+    if (log.isDebugEnabled()) {
+        log.debug("Reading schema entry from {}", position);
+    }
+     
+    return openLedger(position.getLedgerId())
+        .thenCompose((ledger) ->
+            // 读取特定位置的消息 通过 ledger 和 entityId
+            Functions.getLedgerEntry(ledger, position.getEntryId())
+            // 读取完毕后，关闭 ledger
+                .thenCompose(entry -> closeLedger(ledger)
+                    .thenApply(ignore -> entry)
+                )
+                // 解析消息为 schema
+        ).thenCompose(Functions::parseSchemaEntry);
+}
+// 打开 ledger 并返回 ledgerHandle
+private CompletableFuture<LedgerHandle> openLedger(Long ledgerId) {
+    final CompletableFuture<LedgerHandle> future = new CompletableFuture<>();
+    bookKeeper.asyncOpenLedger(
+        ledgerId,
+        BookKeeper.DigestType.fromApiDigestType(config.getManagedLedgerDigestType()),
+        LedgerPassword,
+        (rc, handle, ctx) -> {
+            if (rc != BKException.Code.OK) {
+                future.completeExceptionally(bkException("Failed to open ledger", rc, ledgerId, -1));
+            } else {
+                future.complete(handle);
+            }
+        }, null
+    );
+    return future;
+}
+
+// 已存在的 schema 和 新的schema 的哈希码是否相等，否则根据兼容性策略判断两者是否兼容
+private boolean isCompatible(SchemaAndMetadata existingSchema, SchemaData newSchema,
+                                 SchemaCompatibilityStrategy strategy) {
+    HashCode existingHash = hashFunction.hashBytes(existingSchema.schema.getData());
+    HashCode newHash = hashFunction.hashBytes(newSchema.getData());
+    return newHash.equals(existingHash) ||
+        // 如果新 schema 没有对应的兼容性检查，那么用默认的，否则用配置的兼容性策略进行检查
+        compatibilityChecks.getOrDefault(newSchema.getType(), SchemaCompatibilityCheck.DEFAULT)
+        .isCompatible(existingSchema.schema, newSchema, strategy);
+}
+
+// AvroSchemaCompatibilityCheck 类，Avro Schema 兼容性检查
+public boolean isCompatible(SchemaData from, SchemaData to, SchemaCompatibilityStrategy strategy) {
+    Schema.Parser fromParser = new Schema.Parser();
+    Schema fromSchema = fromParser.parse(new String(from.getData()));
+    Schema.Parser toParser = new Schema.Parser();
+    Schema toSchema =  toParser.parse(new String(to.getData()));
+
+    SchemaValidator schemaValidator = createSchemaValidator(strategy, true);
+    try {
+        schemaValidator.validate(toSchema, Arrays.asList(fromSchema));
+    } catch (SchemaValidationException e) {
+        return false;
+    }
+    return true;
+}
+
+private static SchemaValidator createSchemaValidator(SchemaCompatibilityStrategy compatibilityStrategy,
+                                              boolean onlyLatestValidator) {
+    final SchemaValidatorBuilder validatorBuilder = new SchemaValidatorBuilder();
+    switch (compatibilityStrategy) {
+        case BACKWARD:
+            return createLatestOrAllValidator(validatorBuilder.canReadStrategy(), onlyLatestValidator);
+        case FORWARD:
+            return createLatestOrAllValidator(validatorBuilder.canBeReadStrategy(), onlyLatestValidator);
+        case FULL:
+            return createLatestOrAllValidator(validatorBuilder.mutualReadStrategy(), onlyLatestValidator);
+        default:
+            return NeverSchemaValidator.INSTANCE;
+    }
+}
+
+private static SchemaValidator createLatestOrAllValidator(SchemaValidatorBuilder validatorBuilder, boolean onlyLatest) {
+    return onlyLatest ? validatorBuilder.validateLatest() : validatorBuilder.validateAll();
+}
+
+// 当有消费者或生产者或有消息，则兼容检查
+public CompletableFuture<Boolean> isSchemaCompatible(SchemaData schema) {
+    String base = TopicName.get(getName()).getPartitionedTopicName();
+    String id = TopicName.get(base).getSchemaName();
+    return brokerService.pulsar()
+        .getSchemaRegistryService()
+        .isCompatibleWithLatestVersion(id, schema, schemaCompatibilityStrategy);
+}
+// 最新版本兼容性检查
+public CompletableFuture<Boolean> isCompatibleWithLatestVersion(String schemaId, SchemaData schema,
+                                                                    SchemaCompatibilityStrategy strategy) {
+    return checkCompatibilityWithLatest(schemaId, schema, strategy);
+}
+
+private CompletableFuture<Boolean> checkCompatibilityWithLatest(String schemaId, SchemaData schema,
+                                                                   SchemaCompatibilityStrategy strategy) {
+    // 上文已分析
+    return getSchema(schemaId)
+        .thenApply(
+            (existingSchema) ->
+                !(existingSchema == null || existingSchema.schema.isDeleted()) // 如果 existingSchema 不为空并且 schema 没有删除，则进行兼容性检查
+                    && isCompatible(existingSchema, schema, strategy));
+}
+
+
+// ====================================开始订阅主体=====================================
+// 
+ public CompletableFuture<Consumer> subscribe(final ServerCnx cnx, String subscriptionName, long consumerId,
+        SubType subType, int priorityLevel, String consumerName, boolean isDurable, MessageId startMessageId,
+        Map<String, String> metadata, boolean readCompacted, InitialPosition initialPosition) {
+
+    final CompletableFuture<Consumer> future = new CompletableFuture<>();
+
+    try {
+        // 检查 Topic 是不是当前 broker 所服务的。
+        brokerService.checkTopicNsOwnership(getName());
+    } catch (Exception e) {
+        future.completeExceptionally(e);
+        return future;
+    }
+     // 读压缩特性仅仅允许在独占或故障转移订阅模式
+    if (readCompacted && !(subType == SubType.Failover || subType == SubType.Exclusive)) {
+        future.completeExceptionally(
+                new NotAllowedException("readCompacted only allowed on failover or exclusive subscriptions"));
+        return future;
+    }
+    // 订阅名不能为空
+    if (isBlank(subscriptionName)) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Empty subscription name", topic);
+        }
+        future.completeExceptionally(new NamingException("Empty subscription name"));
+        return future;
+    }
+    // 消费者不支持批量消息
+    if (hasBatchMessagePublished && !cnx.isBatchMessageCompatibleVersion()) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Consumer doesn't support batch-message {}", topic, subscriptionName);
+        }
+        future.completeExceptionally(new UnsupportedVersionException("Consumer doesn't support batch-message"));
+        return future;
+    }
+    // 不能订阅保留订阅名（即订阅名不能带有副本前缀 或者 去重名 pulsar.dedup）
+    if (subscriptionName.startsWith(replicatorPrefix) || subscriptionName.equals(DEDUPLICATION_CURSOR_NAME)) {
+        log.warn("[{}] Failed to create subscription for {}", topic, subscriptionName);
+        future.completeExceptionally(new NamingException("Subscription with reserved subscription name attempted"));
+        return future;
+    }
+    // 订阅限制速率（主机名或IP，消费者名，消费者ID）
+    if (cnx.getRemoteAddress() != null && cnx.getRemoteAddress().toString().contains(":")) {
+        SubscribeRateLimiter.ConsumerIdentifier consumer = new SubscribeRateLimiter.ConsumerIdentifier(
+                cnx.getRemoteAddress().toString().split(":")[0], consumerName, consumerId);
+        // 如果订阅限速器不为空，并且订阅限制列表有指定消费者或消费许可已达上限  或 无法获取许可，则不允许订阅
+        if (subscribeRateLimiter.isPresent() && !subscribeRateLimiter.get().subscribeAvailable(consumer) || !subscribeRateLimiter.get().tryAcquire(consumer)) {
+            log.warn("[{}] Failed to create subscription for {} {} limited by {}, available {}",
+                    topic, subscriptionName, consumer, subscribeRateLimiter.get().getSubscribeRate(),
+                    subscribeRateLimiter.get().getAvailableSubscribeRateLimit(consumer));
+            future.completeExceptionally(new NotAllowedException("Subscribe limited by subscribe rate limit per consumer."));
+            return future;
+        }
+    }
+
+    lock.readLock().lock();
+    try {//Topic 是否已关闭或被删除
+        if (isFenced) {
+            log.warn("[{}] Attempting to subscribe to a fenced topic", topic);
+            future.completeExceptionally(new TopicFencedException("Topic is temporarily unavailable"));
+            return future;
+        }
+        // 递增消费者引用计数
+        USAGE_COUNT_UPDATER.incrementAndGet(this);
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] [{}] [{}] Added consumer -- count: {}", topic, subscriptionName, consumerName,
+                    USAGE_COUNT_UPDATER.get(this));
+        }
+    } finally {
+        lock.readLock().unlock();
+    }
+    // 这里区分持久化游标和非持久化游标，当 isDurable 为 true时，为持久化游标
+    CompletableFuture<? extends Subscription> subscriptionFuture = isDurable ? //
+            getDurableSubscription(subscriptionName, initialPosition) //
+            : getNonDurableSubscription(subscriptionName, startMessageId);
+    // 如果为持久化，确定最大未确认消息，否则为0
+    int maxUnackedMessages  = isDurable ? brokerService.pulsar().getConfiguration().getMaxUnackedMessagesPerConsumer() :0;
+
+    subscriptionFuture.thenAccept(subscription -> {
+        try {
+            Consumer consumer = new Consumer(subscription, subType, topic, consumerId, priorityLevel, consumerName,
+                                             maxUnackedMessages, cnx, cnx.getRole(), metadata, readCompacted, initialPosition);
+            subscription.addConsumer(consumer);
+            if (!cnx.isActive()) {
+                consumer.close();
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] [{}] [{}] Subscribe failed -- count: {}", topic, subscriptionName,
+                            consumer.consumerName(), USAGE_COUNT_UPDATER.get(PersistentTopic.this));
+                }
+                future.completeExceptionally(
+                        new BrokerServiceException("Connection was closed while the opening the cursor "));
+            } else {
+                log.info("[{}][{}] Created new subscription for {}", topic, subscriptionName, consumerId);
+                future.complete(consumer);
+            }
+        } catch (BrokerServiceException e) {
+            if (e instanceof ConsumerBusyException) {
+                log.warn("[{}][{}] Consumer {} {} already connected", topic, subscriptionName, consumerId,
+                        consumerName);
+            } else if (e instanceof SubscriptionBusyException) {
+                log.warn("[{}][{}] {}", topic, subscriptionName, e.getMessage());
+            }
+
+            USAGE_COUNT_UPDATER.decrementAndGet(PersistentTopic.this);
+            future.completeExceptionally(e);
+        }
+    }).exceptionally(ex -> {
+        log.warn("[{}] Failed to create subscription for {}: ", topic, subscriptionName, ex.getMessage());
+        USAGE_COUNT_UPDATER.decrementAndGet(PersistentTopic.this);
+        future.completeExceptionally(new PersistenceException(ex));
+        return null;
+    });
+
+    return future;
+}
+
+private CompletableFuture<Subscription> getDurableSubscription(String subscriptionName, InitialPosition initialPosition) {
+    CompletableFuture<Subscription> subscriptionFuture = new CompletableFuture<>();
+    // 打开游标，订阅名经过 URL 编码后，成游标名，起始位置为 initialPostion （也就是说，会从这个位置开始推送消息）
+    ledger.asyncOpenCursor(Codec.encode(subscriptionName), initialPosition, new OpenCursorCallback() {
+        @Override
+        public void openCursorComplete(ManagedCursor cursor, Object ctx) {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}][{}] Opened cursor", topic, subscriptionName);
+            }
+            // 这里就订阅成功了
+            subscriptionFuture.complete(subscriptions.computeIfAbsent(subscriptionName,
+                    name -> createPersistentSubscription(subscriptionName, cursor)));
+        }
+
+        @Override
+        public void openCursorFailed(ManagedLedgerException exception, Object ctx) {
+            log.warn("[{}] Failed to create subscription for {}: {}", topic, subscriptionName, exception.getMessage());
+            USAGE_COUNT_UPDATER.decrementAndGet(PersistentTopic.this);
+            subscriptionFuture.completeExceptionally(new PersistenceException(exception));
+            if (exception instanceof ManagedLedgerFencedException) {
+                // 如果 ledger 已经关闭了，就不能继续用它了，应该关闭它重新打开。
+                close();
+            }
+        }
+    }, null);
+    return subscriptionFuture;
+}
+
+// 异步打开游标
+public synchronized void asyncOpenCursor(final String cursorName, final InitialPosition initialPosition,
+        final OpenCursorCallback callback, final Object ctx) {
+    try {
+        //检查 ledger 是否打开状态
+        checkManagedLedgerIsOpen();
+        //检查 ledger 是否已关闭或删除
+        checkFenced();
+    } catch (ManagedLedgerException e) {
+        callback.openCursorFailed(e, ctx);
+        return;
+    }
+    // 查看未初始化完成游标中是否有当前游标，如果有，则直接这里设置回调，并返回
+    if (uninitializedCursors.containsKey(cursorName)) {
+        uninitializedCursors.get(cursorName).thenAccept(cursor -> {
+            callback.openCursorComplete(cursor, ctx);
+        }).exceptionally(ex -> {
+            callback.openCursorFailed((ManagedLedgerException) ex, ctx);
+            return null;
+        });
+        return;
+    }
+    // 根据游标名读取游标，如果不为空，则直接回调，并返回
+    ManagedCursor cachedCursor = cursors.get(cursorName);
+    if (cachedCursor != null) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Cursor was already created {}", name, cachedCursor);
+        }
+        callback.openCursorComplete(cachedCursor, ctx);
+        return;
+    }
+
+    // 到这里，意味着创建新的游标并且保存它
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Creating new cursor: {}", name, cursorName);
+    }
+    final ManagedCursorImpl cursor = new ManagedCursorImpl(bookKeeper, config, this, cursorName);
+    CompletableFuture<ManagedCursor> cursorFuture = new CompletableFuture<>();
+    uninitializedCursors.put(cursorName, cursorFuture);
+    cursor.initialize(getLastPosition(), new VoidCallback() {
+        @Override
+        public void operationComplete() {
+            log.info("[{}] Opened new cursor: {}", name, cursor);
+            // 创建游标成功，把当前游标激活
+            cursor.setActive();
+            // 更新确认 position （当游标正在创建的时候，忽略消息写入），如果初始化 position 为 InitialPosition.Latest，
+            // 则获取最后 position 和 消息总计数，否则就 ledger 的（就是 ledger 的 entryId = -1），之前的所有ledger历史总计数
+            // 这里就是初始化游标 position ，决定着订阅起始点
+            cursor.initializeCursorPosition(initialPosition == InitialPosition.Latest ? getLastPositionAndCounter()
+                    : getFirstPositionAndCounter());
+            // 新增游标，移除等待队列中的 futrue
+            synchronized (this) {
+                cursors.add(cursor);
+                uninitializedCursors.remove(cursorName).complete(cursor);
+            }
+            // 执行成功
+            callback.openCursorComplete(cursor, ctx);
+        }
+
+        @Override
+        public void operationFailed(ManagedLedgerException exception) {
+            log.warn("[{}] Failed to open cursor: {}", name, cursor);
+            // 通知等待队列中 future 异常
+            synchronized (this) {
+                uninitializedCursors.remove(cursorName).completeExceptionally(exception);
+            }
+            // 执行失败
+            callback.openCursorFailed(exception, ctx);
+        }
+    });
+}
+
+// 这里是初始化游标位置，决定消费者从哪个 position 读，哪个 position 标记删除，以及当前可消费消息计数
+void initializeCursorPosition(Pair<PositionImpl, Long> lastPositionCounter) {
+    readPosition = ledger.getNextValidPosition(lastPositionCounter.getLeft());
+    markDeletePosition = lastPositionCounter.getLeft();
+
+    // 初始化计数器，使得写在 ML 和 messagesConsumed 上的消息之间的差异为0，以确保初始积压计数为0。
+    messagesConsumedCounter = lastPositionCounter.getRight();
+}
+
+// 游标实现类，构造方法，创建一个管理游标
+ManagedCursorImpl(BookKeeper bookkeeper, ManagedLedgerConfig config, ManagedLedgerImpl ledger, String cursorName) {
+    this.bookkeeper = bookkeeper;
+    this.config = config;
+    this.ledger = ledger;
+    this.name = cursorName;
+    this.digestType = BookKeeper.DigestType.fromApiDigestType(config.getDigestType());
+    STATE_UPDATER.set(this, State.Uninitialized);
+    PENDING_MARK_DELETED_SUBMITTED_COUNT_UPDATER.set(this, 0);
+    PENDING_READ_OPS_UPDATER.set(this, 0);
+    RESET_CURSOR_IN_PROGRESS_UPDATER.set(this, FALSE);
+    WAITING_READ_OP_UPDATER.set(this, null);
+    this.clock = config.getClock();
+    this.lastActive = this.clock.millis();
+    this.lastLedgerSwitchTimestamp = this.clock.millis();
+
+    if (config.getThrottleMarkDelete() > 0.0) {
+        markDeleteLimiter = RateLimiter.create(config.getThrottleMarkDelete());
+    } else {
+        // Disable mark-delete rate limiter
+        markDeleteLimiter = null;
+    }
+}
+
+// 游标初始化
+void initialize(PositionImpl position, final VoidCallback callback) {
+    recoveredCursor(position, Collections.emptyMap(), null);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Consumer {} cursor initialized with counters: consumed {} mdPos {} rdPos {}",
+                ledger.getName(), name, messagesConsumedCounter, markDeletePosition, readPosition);
+    }
+
+    createNewMetadataLedger(new VoidCallback() {
+        @Override
+        public void operationComplete() {
+            STATE_UPDATER.set(ManagedCursorImpl.this, State.Open);
+            callback.operationComplete();
+        }
+
+        @Override
+        public void operationFailed(ManagedLedgerException exception) {
+            callback.operationFailed(exception);
+        }
+    });
+}
+
+// 尝试恢复游标
+private void recoveredCursor(PositionImpl position, Map<String, Long> properties,
+                                 LedgerHandle recoveredFromCursorLedger) {
+    
+    // 如果 position 位于不存在的 ledger 中（因为如果以前是空的，它将被删除），需要转移到下一个已存在的 ledger。
+    if (!ledger.ledgerExists(position.getLedgerId())) {
+        // 获取下一个 ledger
+        Long nextExistingLedger = ledger.getNextValidLedger(position.getLedgerId());
+        // 下一个为空
+        if (nextExistingLedger == null) {
+            log.info("[{}] [{}] Couldn't find next next valid ledger for recovery {}", ledger.getName(), name,
+                    position);
+        }
+        // 重置下 position
+        position = nextExistingLedger != null ? PositionImpl.get(nextExistingLedger, -1) : position;
+    }
+    // 对比下 ledger 最新的 position,如果 position 大,则设置为 ledger 当前最新 position
+    if (position.compareTo(ledger.getLastPosition()) > 0) {
+        log.warn("[{}] [{}] Current position {} is ahead of last position {}", ledger.getName(), name, position,
+                ledger.getLastPosition());
+        position = PositionImpl.get(ledger.getLastPosition());
+    }
+    log.info("[{}] Cursor {} recovered to position {}", ledger.getName(), name, position);
+    // 获取可消费消息计数
+    messagesConsumedCounter = -getNumberOfEntries(Range.openClosed(position, ledger.getLastPosition()));
+    // 标记删除 position 位置
+    markDeletePosition = position;
+    // 找到下一个可读消息位置
+    readPosition = ledger.getNextValidPosition(position);
+    // 最后标记删除消息
+    lastMarkDeleteEntry = new MarkDeleteEntry(markDeletePosition, properties, null, null);
+    // assign cursor-ledger so, it can be deleted when new ledger will be switched
+    // 分配 curor-ledger ，可以在切换新 ledger 时删除它
+    this.cursorLedger = recoveredFromCursorLedger;
+    // 设置当前状态为没有 ledger
+    STATE_UPDATER.set(this, State.NoLedger);
+}
+
+// 获取可消费消息个数
+protected long getNumberOfEntries(Range<PositionImpl> range) {
+    long allEntries = ledger.getNumberOfEntries(range);
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] getNumberOfEntries. {} allEntries: {}", ledger.getName(), range, allEntries);
+    }
+
+    long deletedEntries = 0;
+
+    lock.readLock().lock();
+    try {
+        //单个被删除的消息集合(简单的说就是ledger中形成了不能消费的空洞,要统计空洞的数量出来)
+        for (Range<PositionImpl> r : individualDeletedMessages.asRanges()) {
+            // r 是否在 range 之间
+            if (r.isConnected(range)) {
+                // 返回 r 与 range 的交集(即被删除的消息)
+                Range<PositionImpl> commonEntries = r.intersection(range);
+                // 统计交集的消息数
+                long commonCount = ledger.getNumberOfEntries(commonEntries);
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] [{}] Discounting {} entries for already deleted range {}", ledger.getName(),
+                            name, commonCount, commonEntries);
+                }
+                deletedEntries += commonCount;
+            }
+        }
+    } finally {
+        lock.readLock().unlock();
+    }
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Found {} entries - deleted: {}",
+            ledger.getName(), allEntries - deletedEntries, deletedEntries);
+    }
+    return allEntries - deletedEntries;
+}
+
+// 在指定范围内获取消息总数
+long getNumberOfEntries(Range<PositionImpl> range) {
+    PositionImpl fromPosition = range.lowerEndpoint();
+    boolean fromIncluded = range.lowerBoundType() == BoundType.CLOSED;
+    PositionImpl toPosition = range.upperEndpoint();
+    boolean toIncluded = range.upperBoundType() == BoundType.CLOSED;
+
+    if (fromPosition.getLedgerId() == toPosition.getLedgerId()) {
+        // 如果2个 position 在同一 ledger 上 
+        long count = toPosition.getEntryId() - fromPosition.getEntryId() - 1;
+        count += fromIncluded ? 1 : 0;
+        count += toIncluded ? 1 : 0;
+        return count;
+    } else {
+        long count = 0;
+        // 如果起始 position 与 截止 position 在不同的 ledger 上,则需要
+        // 1. 对于截止 position , entryId 就是消息个数
+        count += toPosition.getEntryId();
+        // 如果包含截止 position ,则 + 1
+        count += toIncluded ? 1 : 0;
+
+        // 2. 对于起始 position 所在 ledger,则 每个 ledger 的消息个数减去起始 position 再减1
+        // 如果包含起始 position ,则 + 1
+        LedgerInfo li = ledgers.get(fromPosition.getLedgerId());
+        if (li != null) {
+            count += li.getEntries() - (fromPosition.getEntryId() + 1);
+            count += fromIncluded ? 1 : 0;
+        }
+
+        // 3. 这里就简单了,直接给出 ledgers 在 fromPosition 的 ledgerId 到 toPosition 的 ledgerId 之间的子集,子集中各个 ledger 中消息总数相加
+        for (LedgerInfo ls : ledgers.subMap(fromPosition.getLedgerId(), false, toPosition.getLedgerId(), false)
+                .values()) {
+            count += ls.getEntries();
+        }
+
+        return count;
+    }
+}
+
+// 指定 position ,找出下一可用的 position
+PositionImpl getNextValidPosition(final PositionImpl position) {
+    PositionImpl nextPosition = position.getNext();
+    while (!isValidPosition(nextPosition)) {
+        // 返回大于等于的最小 nextPosition.ledgerId() + 1 ,如果没有返回 null
+        Long nextLedgerId = ledgers.ceilingKey(nextPosition.getLedgerId() + 1);
+        if (nextLedgerId == null) {
+            return null;
+        }
+        nextPosition = PositionImpl.get(nextLedgerId.longValue(), 0);
+    }
+    return nextPosition;
+}
+// 校验 position 是否合法
+boolean isValidPosition(PositionImpl position) {
+    PositionImpl last = lastConfirmedEntry;
+    if (log.isDebugEnabled()) {
+        log.debug("IsValid position: {} -- last: {}", position, last);
+    }
+    // position 小于 0 ,不合法
+    if (position.getEntryId() < 0) {
+        return false;
+    // 比最后确认消息都大,不合法
+    } else if (position.getLedgerId() > last.getLedgerId()) {
+        return false;
+    } else if (position.getLedgerId() == last.getLedgerId()) {
+        // 不能大于最后确认消息的下一消息
+        return position.getEntryId() <= (last.getEntryId() + 1);
+    } else {
+        // 从 ledgers map中找出 ledger
+        LedgerInfo ls = ledgers.get(position.getLedgerId());
+        // 如果为空
+        if (ls == null) {
+            if (position.getLedgerId() < last.getLedgerId()) {
+                // 指向比当前 ledger 旧的现有 ledger 无效
+                return false;
+            } else {
+                // 指向不存在的 ledger 仅在 ledger 为空时才合法
+                return position.getEntryId() == 0;
+            }
+        }
+        // entryId 不能大于每个 ledger 的容量
+        return position.getEntryId() < ls.getEntries();
+    }
+}
+
+// 创建新的元数据 ledger,其实就是创建存储游标位置的 ledger
+void createNewMetadataLedger(final VoidCallback callback) {
+    ledger.mbean.startCursorLedgerCreateOp();
+    //异步创建 ledger
+    ledger.asyncCreateLedger(bookkeeper, config, digestType, (rc, lh, ctx) -> {
+         // 判定是否超时,如果超时则异步删除ledger
+        if (ledger.checkAndCompleteLedgerOpTask(rc, lh, ctx)) {
+            return;
+        }
+        // 执行创建 ledger 后,开始处理结果
+        ledger.getExecutor().execute(safeRun(() -> {
+            ledger.mbean.endCursorLedgerCreateOp();
+            // 创建错误.
+            if (rc != BKException.Code.OK) {
+                log.warn("[{}] Error creating ledger for cursor {}: {}", ledger.getName(), name,
+                        BKException.getMessage(rc));
+                callback.operationFailed(new ManagedLedgerException(BKException.getMessage(rc)));
+                return;
+            }
+
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Created ledger {} for cursor {}", ledger.getName(), lh.getId(), name);
+            }
+            // 已成功创建 ledger ,现在开始写入最后 position 消息
+            MarkDeleteEntry mdEntry = lastMarkDeleteEntry;
+            // 保存 position 到 leger
+            persistPositionToLedger(lh, mdEntry, new VoidCallback() {
+                @Override
+                public void operationComplete() {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}] Persisted position {} for cursor {}", ledger.getName(),
+                                mdEntry.newPosition, name);
+                    }
+                    // 如果保存 position 成功，则切换新的 ledger
+                    switchToNewLedger(lh, new VoidCallback() {
+                        @Override
+                        public void operationComplete() {
+                            callback.operationComplete();
+                        }
+
+                        @Override
+                        public void operationFailed(ManagedLedgerException exception) {
+                            // 这意味着它无法切换新创建的 ledger，故删除以防止泄漏（无法完全切换，新建的 ledger 沦为垃圾要删除）
+                            bookkeeper.asyncDeleteLedger(lh.getId(), (int rc, Object ctx) -> {
+                                if (rc != BKException.Code.OK) {
+                                    log.warn("[{}] Failed to delete orphan ledger {}", ledger.getName(),
+                                            lh.getId());
+                                }
+                            }, null);
+                            callback.operationFailed(exception);
+                        }
+                    });
+                }
+
+                @Override
+                public void operationFailed(ManagedLedgerException exception) {
+                    log.warn("[{}] Failed to persist position {} for cursor {}", ledger.getName(),
+                            mdEntry.newPosition, name);
+
+                    ledger.mbean.startCursorLedgerDeleteOp();
+                    // 保存失败，删除 ledger
+                    bookkeeper.asyncDeleteLedger(lh.getId(), new DeleteCallback() {
+                        @Override
+                        public void deleteComplete(int rc, Object ctx) {
+                            ledger.mbean.endCursorLedgerDeleteOp();
+                        }
+                    }, null);
+                    callback.operationFailed(exception);
+                }
+            });
+        }));
+    }, LedgerMetadataUtils.buildAdditionalMetadataForCursor(name));
+
+}
+
+// 这里检查和完成 ledger 的操作任务
+protected boolean checkAndCompleteLedgerOpTask(int rc, LedgerHandle lh, Object ctx) {
+    if (ctx != null && ctx instanceof AtomicBoolean) {
+        // ledger-creation 已经超时,故回调已执行,删除 ledger 并返回.
+        if (((AtomicBoolean) (ctx)).get()) {
+            if (rc == BKException.Code.OK) {
+                log.warn("[{}]-{} ledger creation timed-out, deleting ledger", this.name, lh.getId());
+                asyncDeleteLedger(lh.getId(), DEFAULT_LEDGER_DELETE_RETRIES);
+            }
+            return true;
+        }
+        ((AtomicBoolean) ctx).set(true);
+    }
+    return false;
+}
+
+protected void asyncCreateLedger(BookKeeper bookKeeper, ManagedLedgerConfig config, DigestType digestType,
+            CreateCallback cb, Map<String, byte[]> metadata) {
+    AtomicBoolean ledgerCreated = new AtomicBoolean(false);
+    Map<String, byte[]> finalMetadata = new HashMap<>();
+    finalMetadata.putAll(ledgerMetadata);
+    finalMetadata.putAll(metadata);
+    if (log.isDebugEnabled()) {
+        log.debug("creating ledger, metadata: "+finalMetadata);
+    }
+    // bookkeeper 异步创建 ledger
+    bookKeeper.asyncCreateLedger(config.getEnsembleSize(), config.getWriteQuorumSize(), config.getAckQuorumSize(),
+            digestType, config.getPassword(), cb, ledgerCreated, finalMetadata);
+    // 规定时间(MetadataOperationsTimeoutSeconds)内,如果创建没完成,则置为超时
+    scheduledExecutor.schedule(() -> {
+        if (!ledgerCreated.get()) {
+            ledgerCreated.set(true);
+            cb.createComplete(BKException.Code.TimeoutException, null, null);
+        }
+    }, config.getMetadataOperationsTimeoutSeconds(), TimeUnit.SECONDS);
+}
+
+// 保存 Position 到 ledger 中
+void persistPositionToLedger(final LedgerHandle lh, MarkDeleteEntry mdEntry, final VoidCallback callback) {
+    PositionImpl position = mdEntry.newPosition;
+    // 构建 Position 信息(就是游标信息,游标开销还是蛮低的)
+    PositionInfo pi = PositionInfo.newBuilder().setLedgerId(position.getLedgerId())
+            .setEntryId(position.getEntryId())
+            .addAllIndividualDeletedMessages(buildIndividualDeletedMessageRanges())
+            .addAllProperties(buildPropertiesMap(mdEntry.properties)).build();
+
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Cursor {} Appending to ledger={} position={}", ledger.getName(), name, lh.getId(),
+                position);
+    }
+
+    checkNotNull(lh);
+    lh.asyncAddEntry(pi.toByteArray(), (rc, lh1, entryId, ctx) -> {
+        if (rc == BKException.Code.OK) {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Updated cursor {} position {} in meta-ledger {}", ledger.getName(), name, position,
+                        lh1.getId());
+            }
+
+            if (shouldCloseLedger(lh1)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] Need to create new metadata ledger for consumer {}", ledger.getName(), name);
+                }
+                // 创建新的元数据存储 ledger
+                startCreatingNewMetadataLedger();
+            }
+            // 执行回调，表示已成功完成
+            callback.operationComplete();
+        } else {
+            log.warn("[{}] Error updating cursor {} position {} in meta-ledger {}: {}", ledger.getName(), name,
+                    position, lh1.getId(), BKException.getMessage(rc));
+            // 如果有写错误，ledger 将自动关闭，需要创建一个新的 ledger，同时标记删除操作将排队。
+            STATE_UPDATER.compareAndSet(ManagedCursorImpl.this, State.Open, State.NoLedger);
+
+            // 放弃之前，尝试保存 position 在元数据存储中（即 Zk 中）
+            persistPositionMetaStore(-1, position, mdEntry.properties, new MetaStoreCallback<Void>() {
+                @Override
+                public void operationComplete(Void result, Stat stat) {
+                    if (log.isDebugEnabled()) {
+                        log.debug(
+                                "[{}][{}] Updated cursor in meta store after previous failure in ledger at position {}",
+                                ledger.getName(), name, position);
+                    }
+                    callback.operationComplete();
+                }
+
+                @Override
+                public void operationFailed(MetaStoreException e) {
+                    log.warn("[{}][{}] Failed to update cursor in meta store after previous failure in ledger: {}",
+                            ledger.getName(), name, e.getMessage());
+                    callback.operationFailed(createManagedLedgerException(rc));
+                }
+            }, true);
+        }
+    }, null);
+}
+
+// 是否应该关闭 ledger
+boolean shouldCloseLedger(LedgerHandle lh) {
+    long now = clock.millis();
+    // 最后新增确认大于等于 每个ledger最大消息数或者最后 ledger 切换时间已过,并且当前游标状态不是已关闭或正关闭中
+    if ((lh.getLastAddConfirmed() >= config.getMetadataMaxEntriesPerLedger()
+            || lastLedgerSwitchTimestamp < (now - config.getLedgerRolloverTimeout() * 1000))
+            && (STATE_UPDATER.get(this) != State.Closed && STATE_UPDATER.get(this) != State.Closing)) {
+        // 修改时间戳是安全的，因为此方法只会从回调中调用，这意味着将在一个线程上串行化调用
+        lastLedgerSwitchTimestamp = now;
+        return true;
+    } else {
+        return false;
+    }
+}
+
+void startCreatingNewMetadataLedger() {
+    // 更改状态，以便新的标记删除操作将排队，而不是立即提交(执行)
+    State oldState = STATE_UPDATER.getAndSet(this, State.SwitchingLedger);
+    if (oldState == State.SwitchingLedger) {
+        // 如果正在切换中..则立即返回
+        return;
+    }
+
+    // 正标记删除提交计数,如果等于0，则立即创建新的 ledger
+    if (PENDING_MARK_DELETED_SUBMITTED_COUNT_UPDATER.get(this) == 0) {
+        createNewMetadataLedger();
+    }
+}
+
+// 切换新的 ledger
+void switchToNewLedger(final LedgerHandle lh, final VoidCallback callback) {
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Switching cursor {} to ledger {}", ledger.getName(), name, lh.getId());
+    }
+    // 保存 position 到元数据存储中 （zk中）
+    persistPositionMetaStore(lh.getId(), lastMarkDeleteEntry.newPosition, lastMarkDeleteEntry.properties,
+            new MetaStoreCallback<Void>() {
+        @Override
+        public void operationComplete(Void result, Stat stat) {
+            log.info("[{}] Updated cursor {} with ledger id {} md-position={} rd-position={}", ledger.getName(),
+                    name, lh.getId(), markDeletePosition, readPosition);
+            // 切换
+            final LedgerHandle oldLedger = cursorLedger;
+            cursorLedger = lh;
+            cursorLedgerStat = stat;
+
+            // position 位置安全删除
+            callback.operationComplete();
+            // 异步删除老的 ledger（即老的游标信息将被删除）
+            asyncDeleteLedger(oldLedger);
+        }
+
+        @Override
+        public void operationFailed(MetaStoreException e) {
+            log.warn("[{}] Failed to update consumer {}", ledger.getName(), name, e);
+            callback.operationFailed(e);
+        }
+    }, false);
+}
+
+// 创建持久化订阅
+private PersistentSubscription createPersistentSubscription(String subscriptionName, ManagedCursor cursor) {
+    checkNotNull(compactedTopic);
+    // 对比订阅名，判断是否压缩订阅
+    if (subscriptionName.equals(Compactor.COMPACTION_SUBSCRIPTION)) {
+        return new CompactorSubscription(this, compactedTopic, subscriptionName, cursor);
+    } else {
+        return new PersistentSubscription(this, subscriptionName, cursor);
+    }
+}
+
+// ============================ 非持久化订阅 ===================================
+
+private CompletableFuture<? extends Subscription> getNonDurableSubscription(String subscriptionName, MessageId startMessageId) {
+    CompletableFuture<Subscription> subscriptionFuture = new CompletableFuture<>();
+    log.info("[{}][{}] Creating non-durable subscription at msg id {}", topic, subscriptionName, startMessageId);
+
+    // 仅当第一个消费者连接时，创建一个新的非持久化游标
+    Subscription subscription = subscriptions.computeIfAbsent(subscriptionName, name -> {
+        //起始消息ID不为空，则用起始消息ID，否则用最后的消息ID
+        MessageIdImpl msgId = startMessageId != null ? (MessageIdImpl) startMessageId
+                : (MessageIdImpl) MessageId.latest;
+
+        long ledgerId = msgId.getLedgerId();
+        long entryId = msgId.getEntryId();
+        // 判定是否批量消息ID
+        if (msgId instanceof BatchMessageIdImpl) {
+            // 当起始消息ID是关联一个批量（消息ID）时，需要在（批量消息ID中的）第一个消息ID上取前一个消息ID，因为这批量（消息）可能还没被完全消费，客户端将丢弃在批量消息中的第一个消息
+            if (((BatchMessageIdImpl) msgId).getBatchIndex() >= 0) {//第一个消息
+                entryId = msgId.getEntryId() - 1;//第一个消息的上个消息
+            }
+        }
+        // 确定起始 Position
+        Position startPosition = new PositionImpl(ledgerId, entryId);
+        // 创建非持久化游标
+        ManagedCursor cursor = null;
+        try {
+            cursor = ledger.newNonDurableCursor(startPosition);
+        } catch (ManagedLedgerException e) {
+            subscriptionFuture.completeExceptionally(e);
+        }
+
+        return new PersistentSubscription(this, subscriptionName, cursor);
+    });
+
+    if (!subscriptionFuture.isDone()) {
+        subscriptionFuture.complete(subscription);
+    } else {
+        // failed to initialize managed-cursor: clean up created subscription
+        subscriptions.remove(subscriptionName);
+    }
+
+    return subscriptionFuture;
+}
+
+
+NonDurableCursorImpl(BookKeeper bookkeeper, ManagedLedgerConfig config, ManagedLedgerImpl ledger, String cursorName,
+            PositionImpl startCursorPosition) {
+    super(bookkeeper, config, ledger, cursorName);
+
+    // Compare with "latest" position marker by using only the ledger id. Since the C++ client is using 48bits to
+    // store the entryId, it's not able to pass a Long.max() as entryId. In this case there's no point to require
+    // both ledgerId and entryId to be Long.max()
+    if (startCursorPosition == null || startCursorPosition.getLedgerId() == PositionImpl.latest.getLedgerId()) {
+        // Start from last entry
+        initializeCursorPosition(ledger.getLastPositionAndCounter());
+    } else if (startCursorPosition.equals(PositionImpl.earliest)) {
+        // Start from invalid ledger to read from first available entry
+        recoverCursor(ledger.getPreviousPosition(ledger.getFirstPosition()));
+    } else {
+        // Since the cursor is positioning on the mark-delete position, we need to take 1 step back from the desired
+        // read-position
+        recoverCursor(startCursorPosition);
+    }
+
+    log.info("[{}] Created non-durable cursor read-position={} mark-delete-position={}", ledger.getName(),
+            readPosition, markDeletePosition);
+}
+
+private void recoverCursor(PositionImpl mdPosition) {
+    Pair<PositionImpl, Long> lastEntryAndCounter = ledger.getLastPositionAndCounter();
+    this.readPosition = ledger.getNextValidPosition(mdPosition);
+    markDeletePosition = mdPosition;
+
+    // Initialize the counter such that the difference between the messages written on the ML and the
+    // messagesConsumed is equal to the current backlog (negated).
+    long initialBacklog = readPosition.compareTo(lastEntryAndCounter.getLeft()) < 0
+            ? ledger.getNumberOfEntries(Range.closed(readPosition, lastEntryAndCounter.getLeft())) : 0;
+    messagesConsumedCounter = lastEntryAndCounter.getRight() - initialBacklog;
 }
 
 ```
