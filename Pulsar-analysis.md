@@ -10563,24 +10563,28 @@ protected void handleSubscribe(final CommandSubscribe subscribe) {
 
                             });
                 } else {
+                    // 客户端无权限订阅
                     String msg = "Client is not authorized to subscribe";
                     log.warn("[{}] {} with role {}", remoteAddress, msg, authRole);
                     ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, msg));
                 }
                 return null;
             }).exceptionally(e -> {
+                // 权限验证异常
                 String msg = String.format("[%s] %s with role %s", remoteAddress, e.getMessage(), authRole);
                 log.warn(msg);
                 ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, e.getMessage()));
                 return null;
             });
         } else {
+            // proxy 客户端无权限订阅
             final String msg = "Proxy Client is not authorized to subscribe";
             log.warn("[{}] {} with role {} on topic {}", remoteAddress, msg, authRole, topicName);
             ctx.writeAndFlush(Commands.newError(requestId, ServerError.AuthorizationError, msg));
         }
         return null;
     }).exceptionally(ex -> {
+        // 权限验证异常
         String msg = String.format("[%s] %s with role %s", remoteAddress, ex.getMessage(), authRole);
         if (ex.getCause() instanceof PulsarServerException) {
             log.info(msg);
@@ -11570,37 +11574,45 @@ private CompletableFuture<? extends Subscription> getNonDurableSubscription(Stri
         } catch (ManagedLedgerException e) {
             subscriptionFuture.completeExceptionally(e);
         }
-
+        // 这里跟持久化订阅一样，只不过被回调的方法是空实现，实际上转发给 NonDurableCursorImpl 类
         return new PersistentSubscription(this, subscriptionName, cursor);
     });
 
     if (!subscriptionFuture.isDone()) {
         subscriptionFuture.complete(subscription);
     } else {
-        // failed to initialize managed-cursor: clean up created subscription
+        // 初始化游标失败，清理已创建的订阅
         subscriptions.remove(subscriptionName);
     }
 
     return subscriptionFuture;
 }
 
+// 创建非持久化游标
+public ManagedCursor newNonDurableCursor(Position startCursorPosition) throws ManagedLedgerException {
+    // 检查 ML 是否打开
+    checkManagedLedgerIsOpen();
+    // 检查是否已关闭或删除
+    checkFenced();
 
+    return new NonDurableCursorImpl(bookKeeper, config, this, null, (PositionImpl) startCursorPosition);
+}
+
+// 非持久化类
 NonDurableCursorImpl(BookKeeper bookkeeper, ManagedLedgerConfig config, ManagedLedgerImpl ledger, String cursorName,
             PositionImpl startCursorPosition) {
     super(bookkeeper, config, ledger, cursorName);
 
-    // Compare with "latest" position marker by using only the ledger id. Since the C++ client is using 48bits to
-    // store the entryId, it's not able to pass a Long.max() as entryId. In this case there's no point to require
-    // both ledgerId and entryId to be Long.max()
+    // 仅使用 ledgerId 与“最新” position 标记进行比较。 由于 C++ 客户端使用48位来存储 entryId，
+    // 因此它无法将 Long.max() 作为 entryId 传递(因为 Long.max() 为2的63次方减1)。 在这种情况下，没有必要要求 ledgerId 和 entryId 都是 Long.max()
     if (startCursorPosition == null || startCursorPosition.getLedgerId() == PositionImpl.latest.getLedgerId()) {
-        // Start from last entry
+        // 用最近的 position 初始化游标 position
         initializeCursorPosition(ledger.getLastPositionAndCounter());
     } else if (startCursorPosition.equals(PositionImpl.earliest)) {
-        // Start from invalid ledger to read from first available entry
+        // 用第一个可用消息 position 作为起始订阅 position
         recoverCursor(ledger.getPreviousPosition(ledger.getFirstPosition()));
     } else {
-        // Since the cursor is positioning on the mark-delete position, we need to take 1 step back from the desired
-        // read-position
+        // 由于游标位于标记删除 position，需要从所需的读取 position 向后退一步（即前一个消息 position）
         recoverCursor(startCursorPosition);
     }
 
@@ -11608,19 +11620,772 @@ NonDurableCursorImpl(BookKeeper bookkeeper, ManagedLedgerConfig config, ManagedL
             readPosition, markDeletePosition);
 }
 
+// 恢复游标
 private void recoverCursor(PositionImpl mdPosition) {
+    // 获取新的 position 以及消息计数
     Pair<PositionImpl, Long> lastEntryAndCounter = ledger.getLastPositionAndCounter();
+    // 找到下一可用 position 地址，作为读 position
     this.readPosition = ledger.getNextValidPosition(mdPosition);
+    // 当前地址标识为删除
     markDeletePosition = mdPosition;
 
-    // Initialize the counter such that the difference between the messages written on the ML and the
-    // messagesConsumed is equal to the current backlog (negated).
+    // 初始化计数器，使得写在 managerLedger 和 messagesConsumed 上的消息之间的差异等于当前的积压（否定）。
+    // 其实就是对比当前读游标与最新的 position 之间是否有可用消息，如果有则计算出来，否则为0
     long initialBacklog = readPosition.compareTo(lastEntryAndCounter.getLeft()) < 0
             ? ledger.getNumberOfEntries(Range.closed(readPosition, lastEntryAndCounter.getLeft())) : 0;
     messagesConsumedCounter = lastEntryAndCounter.getRight() - initialBacklog;
 }
 
 ```
+
+自此，订阅接口已经完毕，下面，总结下流程：
+
+1. 跟生产者一样,先进行权限校验(包括 Proxy 和 Client)
+2. 元数据校验
+3. 获取或创建 Topic
+4. 对订阅的 schema 进行兼容性检查或者添加
+5. 如果订阅类型为持久化订阅,则:
+   
+   1. 检查 Topic 是否为当前为 broker 所有
+   2. 检查压缩订阅模式仅支持故障转移或独占订阅
+   3. 检查订阅名不能为空
+   4. 检查消费者不支持批量消息
+   5. 检查订阅名不能为系统保留名
+   6. 检查订阅是否限流
+   7. 检查Topic的状态是否合法
+   8. 打开游标(主要存储消费进度)
+   9. 如果是订阅名为 `__compaction`,则创建压缩 Topic 订阅,否则,创建一般的持久化订阅
+
+6. 否则为非持久化订阅:
+   
+   1. 创建一般的持久化订阅
+
+7. 创建消费者
+8. 尝试用新创建的消费者执行完成,如果成功，则发送订阅成功，否则关闭消费者。
+
+#### 4. newFlow 实现
+
+```java
+
+ protected void handleFlow(CommandFlow flow) {
+    checkArgument(state == State.Connected);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Received flow from consumer {} permits: {}", remoteAddress, flow.getConsumerId(),
+                flow.getMessagePermits());
+    }
+    // 通过消费者ID查找消费者信息
+    CompletableFuture<Consumer> consumerFuture = consumers.get(flow.getConsumerId());
+
+    if (consumerFuture != null && consumerFuture.isDone() && !consumerFuture.isCompletedExceptionally()) {
+        Consumer consumer = consumerFuture.getNow(null);
+        if (consumer != null) {
+            // 流控核心方法
+            consumer.flowPermits(flow.getMessagePermits());
+        } else {
+            log.info("[{}] Couldn't find consumer {}", remoteAddress, flow.getConsumerId());
+        }
+    }
+}
+
+void flowPermits(int additionalNumberOfMessages) {
+    // 消费者给定的推送消息数一定要大于0
+    checkArgument(additionalNumberOfMessages > 0);
+
+    // 当未确认数达到最大未确认消息数限制时，阻塞共享的消费者
+    if (shouldBlockConsumerOnUnackMsgs() && unackedMessages >= maxUnackedMessages) {
+        blockedConsumerOnUnackedMsgs = true;
+    }
+    int oldPermits;
+    if (!blockedConsumerOnUnackedMsgs) {
+        // 如果没超过限制，则设置新的流控消息数
+        oldPermits = MESSAGE_PERMITS_UPDATER.getAndAdd(this, additionalNumberOfMessages);
+        subscription.consumerFlow(this, additionalNumberOfMessages);
+    } else {
+        // 否则暂停（到达这里，意味着不对客户端（消费端）进行响应，任由它超时）
+        oldPermits = PERMITS_RECEIVED_WHILE_CONSUMER_BLOCKED_UPDATER.getAndAdd(this, additionalNumberOfMessages);
+    }
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}-{}] Added more flow control message permits {} (old was: {}), blocked = {} ", topicName,
+                subscription, additionalNumberOfMessages, oldPermits, blockedConsumerOnUnackedMsgs);
+    }
+
+}
+
+//当未确认消息时是否应该阻塞消费者
+//1. 消费者是共享订阅模式
+//2. 最大未确认消息数大于0
+private boolean shouldBlockConsumerOnUnackMsgs() {
+    return SubType.Shared.equals(subType) && maxUnackedMessages > 0;
+}
+
+// ============================= 持久化订阅对应的实现 ===============================
+
+public void consumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+    dispatcher.consumerFlow(consumer, additionalNumberOfMessages);
+}
+
+// 多活消费者实现
+public synchronized void consumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+    // 如果消费者不在消费者集合里面，则忽略
+    if (!consumerSet.contains(consumer)) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Ignoring flow control from disconnected consumer {}", name, consumer);
+        }
+        return;
+    }
+    // 总可用许可（简单的说就是对应一个 Topic ，某时间段的可允许的推送给消费者的消息数）
+    totalAvailablePermits += additionalNumberOfMessages;
+    if (log.isDebugEnabled()) {
+        log.debug("[{}-{}] Trigger new read after receiving flow control message with permits {}", name, consumer,
+                totalAvailablePermits);
+    }
+    // 开始从 bookkeeper 中读取消息
+    readMoreEntries();
+}
+
+
+public void readMoreEntries() {
+    // 如果总可用许可数大于0 并且 当前至少有一个消费者存活
+    if (totalAvailablePermits > 0 && isAtleastOneConsumerAvailable()) {
+        // 读批量大小与总可用许可数取最小值
+        int messagesToRead = Math.min(totalAvailablePermits, readBatchSize);
+
+        // 限制仅仅发生在以下2种情况：（1） 游标不是活动状态（或者 throttle-nonBacklogConsumer 标志被启用）那么活动游标读取
+        // 消息是从缓存而不是 bookkeeper（2）从 bookkeeper 读取消息时，如果 topic 已达到消息速率阈值：则在 MESSAGE_RATE_BACKOFF_MS 之后定时读取
+        if (serviceConfig.isDispatchThrottlingOnNonBacklogConsumerEnabled() || !cursor.isActive()) {
+            // 判断 Topic 级别分发器限流是否启用
+            if (topic.getDispatchRateLimiter().isPresent() && topic.getDispatchRateLimiter().get().isDispatchRateLimitingEnabled()) {
+                DispatchRateLimiter topicRateLimiter = topic.getDispatchRateLimiter().get();
+                // 判断 Topic 级别消息分发器是否有配置限流参数
+                if (!topicRateLimiter.hasMessageDispatchPermit()) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}] message-read exceeded topic message-rate {}/{}, schedule after a {}", name,
+                                topicRateLimiter.getDispatchRateOnMsg(), topicRateLimiter.getDispatchRateOnByte(),
+                                MESSAGE_RATE_BACKOFF_MS);
+                    }
+                    topic.getBrokerService().executor().schedule(() -> readMoreEntries(), MESSAGE_RATE_BACKOFF_MS,
+                            TimeUnit.MILLISECONDS);
+                    return;
+                } else {
+                    // 如果分发器限速启用，则根据可用许可数来给出当前消息读取数
+                    long availablePermitsOnMsg = topicRateLimiter.getAvailableDispatchRateLimitOnMsg();
+                    if (availablePermitsOnMsg > 0) {
+                        messagesToRead = Math.min(messagesToRead, (int) availablePermitsOnMsg);
+                    }
+                }
+            }
+            // 订阅级别的限流器是否配置，这里基本上跟上类似，只是隔离级别不一样，一个是 Topic 级别，一个是订阅级别
+            if (dispatchRateLimiter.isPresent() && dispatchRateLimiter.get().isDispatchRateLimitingEnabled()) {
+                if (!dispatchRateLimiter.get().hasMessageDispatchPermit()) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}] message-read exceeded subscription message-rate {}/{}, schedule after a {}", name,
+                            dispatchRateLimiter.get().getDispatchRateOnMsg(), dispatchRateLimiter.get().getDispatchRateOnByte(),
+                            MESSAGE_RATE_BACKOFF_MS);
+                    }
+                    topic.getBrokerService().executor().schedule(() -> readMoreEntries(), MESSAGE_RATE_BACKOFF_MS,
+                        TimeUnit.MILLISECONDS);
+                    return;
+                } else {
+                    // if dispatch-rate is in msg then read only msg according to available permit
+                    long availablePermitsOnMsg = dispatchRateLimiter.get().getAvailableDispatchRateLimitOnMsg();
+                    if (availablePermitsOnMsg > 0) {
+                        messagesToRead = Math.min(messagesToRead, (int) availablePermitsOnMsg);
+                    }
+                }
+            }
+
+        }
+        // 消息回放不为空
+        if (!messagesToReplay.isEmpty()) {
+            // 如果有真正读取的回放，则跳过本次
+            if (havePendingReplayRead) {
+                log.debug("[{}] Skipping replay while awaiting previous read to complete", name);
+                return;
+            }
+            // 获取正回放消息的 Postition 信息
+            Set<PositionImpl> messagesToReplayNow = messagesToReplay.items(messagesToRead).stream()
+                    .map(pair -> new PositionImpl(pair.first, pair.second)).collect(toSet());
+
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Schedule replay of {} messages for {} consumers", name, messagesToReplayNow.size(),
+                        consumerList.size());
+            }
+            // 设置正回放读标志
+            havePendingReplayRead = true;
+            Set<? extends Position> deletedMessages = cursor.asyncReplayEntries(messagesToReplayNow, this,
+                    ReadType.Replay);
+            // 从回放池中清除已确认的消息
+            deletedMessages.forEach(position -> messagesToReplay.remove(((PositionImpl) position).getLedgerId(),
+                    ((PositionImpl) position).getEntryId()));
+            // 如果所有的消息都已确认，则从消息回放池中清除，尝试读取下一轮消息
+            if ((messagesToReplayNow.size() - deletedMessages.size()) == 0) {
+                havePendingReplayRead = false;
+                readMoreEntries();
+            }
+        } else if (BLOCKED_DISPATCHER_ON_UNACKMSG_UPDATER.get(this) == TRUE) {//分发器读阻塞，因为未确认消息数已达到最大值
+            log.warn("[{}] Dispatcher read is blocked due to unackMessages {} reached to max {}", name,
+                    totalUnackedMessages, maxUnackedMessages);
+        } else if (!havePendingRead) {//暂没读取任务，则开始读取
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Schedule read of {} messages for {} consumers", name, messagesToRead,
+                        consumerList.size());
+            }
+            havePendingRead = true;
+            // 游标异步读取消息或等待，前面章节已分析过，这里不再赘述
+            cursor.asyncReadEntriesOrWait(messagesToRead, this, ReadType.Normal);
+        } else {
+            // 等前一个读完成
+            log.debug("[{}] Cannot schedule next read until previous one is done", name);
+        }
+    } else {
+        // 消费者缓存满了，暂停读取
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Consumer buffer is full, pause reading", name);
+        }
+    }
+}
+
+public boolean hasMessageDispatchPermit() {
+    return (dispatchRateLimiterOnMessage == null || dispatchRateLimiterOnMessage.getAvailablePermits() > 0)
+            && (dispatchRateLimiterOnByte == null || dispatchRateLimiterOnByte.getAvailablePermits() > 0);
+}
+
+// 从 position 集合中获取已确认消息的 position
+public Set<? extends Position> asyncReplayEntries(final Set<? extends Position> positions,
+        ReadEntriesCallback callback, Object ctx) {
+
+    List<Entry> entries = Lists.newArrayListWithExpectedSize(positions.size());
+    // 如果 position 集合为空，则直接返回
+    if (positions.isEmpty()) {
+        callback.readEntriesComplete(entries, ctx);
+    }
+
+    // 过滤掉已经确认的消息
+    Set<Position> alreadyAcknowledgedPositions = Sets.newHashSet();
+    lock.readLock().lock();
+    try {
+        // 判定 position 如果位于单独删除消息集合或小于标记删除 position，则认为是已确认消息
+        positions.stream()
+                .filter(position -> individualDeletedMessages.contains((PositionImpl) position)
+                        || ((PositionImpl) position).compareTo(markDeletePosition) < 0)
+                .forEach(alreadyAcknowledgedPositions::add);
+    } finally {
+        lock.readLock().unlock();
+    }
+    // 总不可用 position 数
+    final int totalValidPositions = positions.size() - alreadyAcknowledgedPositions.size();
+    final AtomicReference<ManagedLedgerException> exception = new AtomicReference<>();
+    ReadEntryCallback cb = new ReadEntryCallback() {
+        int pendingCallbacks = totalValidPositions;
+
+        @Override
+        public synchronized void readEntryComplete(Entry entry, Object ctx) {
+            if (exception.get() != null) {
+                // 如果在一个不同的 position 有异常，则释放实体，并不要把它放入列表
+                entry.release();
+                if (--pendingCallbacks == 0) {
+                    callback.readEntriesFailed(exception.get(), ctx);
+                }
+            } else {
+                entries.add(entry);
+                if (--pendingCallbacks == 0) {
+                    callback.readEntriesComplete(entries, ctx);
+                }
+            }
+        }
+
+        @Override
+        public synchronized void readEntryFailed(ManagedLedgerException mle, Object ctx) {
+            log.warn("[{}][{}] Error while replaying entries", ledger.getName(), name, mle);
+            if (exception.compareAndSet(null, mle)) {
+                // 尝试设置异常，如果成功只要读取异常，则释放所有实体
+                entries.forEach(Entry::release);
+            }
+            if (--pendingCallbacks == 0) {
+                callback.readEntriesFailed(exception.get(), ctx);
+            }
+        }
+    };
+    // 这里异步读取 position 对应的消息
+    positions.stream().filter(position -> !alreadyAcknowledgedPositions.contains(position))
+            .forEach(p -> ledger.asyncReadEntry((PositionImpl) p, cb, ctx));
+
+    return alreadyAcknowledgedPositions;
+}
+
+// 回放池异步读取消息成功执行
+public synchronized void readEntriesComplete(List<Entry> entries, Object ctx) {
+    ReadType readType = (ReadType) ctx;
+    int start = 0;
+    int entriesToDispatch = entries.size();
+    // 读类型
+    if (readType == ReadType.Normal) {
+        havePendingRead = false;
+    } else {
+        havePendingReplayRead = false;
+    }
+    // 确定分发器批量读取消息大小
+    if (readBatchSize < serviceConfig.getDispatcherMaxReadBatchSize()) {
+        int newReadBatchSize = Math.min(readBatchSize * 2, serviceConfig.getDispatcherMaxReadBatchSize());
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Increasing read batch size from {} to {}", name, readBatchSize, newReadBatchSize);
+        }
+
+        readBatchSize = newReadBatchSize;
+    }
+    // 如果读消息失败，则减半
+    readFailureBackoff.reduceToHalf();
+    // 在读或重放之前应该把游标重置（即以标记删除 position 的下一个消息为新的读 position）
+    if (shouldRewindBeforeReadingOrReplaying && readType == ReadType.Normal) {
+        //当前所有消息释放
+        entries.forEach(Entry::release);
+        // 重置
+        cursor.rewind();
+        shouldRewindBeforeReadingOrReplaying = false;
+        // 开始读消息
+        readMoreEntries();
+        return;
+    }
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Distributing {} messages to {} consumers", name, entries.size(), consumerList.size());
+    }
+
+    long totalMessagesSent = 0;
+    long totalBytesSent = 0;
+    // 如果消息待分发数、总可用许可数大于0，并且至少有一个消费者可用（其连接通道可写）
+    while (entriesToDispatch > 0 && totalAvailablePermits > 0 && isAtleastOneConsumerAvailable()) {
+        // 上文已经解析过获取消费者(消费者优先级，轮询)
+        Consumer c = getNextConsumer();
+        if (c == null) {
+            // 当前没消费者，游标将重置（即当前标记删除的position的下一个消息为读 position）
+            log.info("[{}] rewind because no available consumer found from total {}", name, consumerList.size());
+            // 释放消息
+            entries.subList(start, entries.size()).forEach(Entry::release);
+            cursor.rewind();
+            return;
+        }
+
+        // 消费者轮询批量分发
+        int messagesForC = Math.min(
+            Math.min(entriesToDispatch, c.getAvailablePermits()),
+            serviceConfig.getDispatcherMaxRoundRobinBatchSize());
+        // 如果分发数大于0
+        if (messagesForC > 0) {
+
+            // 如果读取类型为 ReadType.Replay （重放），则移除对应的回放池中消息
+            if (readType == ReadType.Replay) {
+                entries.subList(start, start + messagesForC).forEach(entry -> {
+                    messagesToReplay.remove(entry.getLedgerId(), entry.getEntryId());
+                });
+            }
+            // 组成消息包，发送给消费者
+            SendMessageInfo sentMsgInfo = c.sendMessages(entries.subList(start, start + messagesForC));
+            // 统计指标，准备下一轮发送
+            long msgSent = sentMsgInfo.getTotalSentMessages();
+            start += messagesForC;
+            entriesToDispatch -= messagesForC;
+            totalAvailablePermits -= msgSent;
+            totalMessagesSent += sentMsgInfo.getTotalSentMessages();
+            totalBytesSent += sentMsgInfo.getTotalSentMessageBytes();
+        }
+    }
+
+    // 启用非积压消费者的分发限制（简单的说就是体现配额限制） 或者游标不活动了，尝试把这些数据放入限流器中
+    if (serviceConfig.isDispatchThrottlingOnNonBacklogConsumerEnabled() || !cursor.isActive()) {
+        if (topic.getDispatchRateLimiter().isPresent()) {
+            topic.getDispatchRateLimiter().get().tryDispatchPermit(totalMessagesSent, totalBytesSent);
+        }
+
+        if (dispatchRateLimiter.isPresent()) {
+            dispatchRateLimiter.get().tryDispatchPermit(totalMessagesSent, totalBytesSent);
+        }
+    }
+    // 如果此时待分发数还大于0
+    if (entriesToDispatch > 0) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] No consumers found with available permits, storing {} positions for later replay", name,
+                    entries.size() - start);
+        }
+        // 把剩余的消息（未分发给消息者的）存到消息回放池
+        entries.subList(start, entries.size()).forEach(entry -> {
+            messagesToReplay.add(entry.getLedgerId(), entry.getEntryId());
+            entry.release();
+        });
+    }
+    // 继续读更多的消息
+    readMoreEntries();
+}
+
+
+// 回放池读取消息失败
+public synchronized void readEntriesFailed(ManagedLedgerException exception, Object ctx) {
+
+    ReadType readType = (ReadType) ctx;
+    // 获取读下一次等待时间
+    long waitTimeMillis = readFailureBackoff.next();
+    // 没有更多消息可读异常
+    if (exception instanceof NoMoreEntriesToReadException) {
+        // 如果挤压队列消息为0，则通知消费者集合已达到 Topic 的末尾（换句话说就是：此时刻，Topic 中的消息已全部消费）
+        if (cursor.getNumberOfEntriesInBacklog() == 0) {
+            // Topic 已被终止，并且没有更多消息可供读取且所有消息已被确认时，通知消费者
+            consumerList.forEach(Consumer::reachedEndOfTopic);
+        }
+    } else if (!(exception instanceof TooManyRequestsException)) {
+        // 读请求异常
+        log.error("[{}] Error reading entries at {} : {}, Read Type {} - Retrying to read in {} seconds", name,
+                cursor.getReadPosition(), exception.getMessage(), readType, waitTimeMillis / 1000.0);
+    } else {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Error reading entries at {} : {}, Read Type {} - Retrying to read in {} seconds", name,
+                    cursor.getReadPosition(), exception.getMessage(), readType, waitTimeMillis / 1000.0);
+        }
+    }
+    //前面已说明
+    if (shouldRewindBeforeReadingOrReplaying) {
+        shouldRewindBeforeReadingOrReplaying = false;
+        cursor.rewind();
+    }
+    // 如果读类型为正常类型，则设置 havePendingRead 为false
+    if (readType == ReadType.Normal) {
+        havePendingRead = false;
+    } else {
+        havePendingReplayRead = false;
+        // 异常为不可用回放 position 异常，则移除那些已删除的消息ID
+        if (exception instanceof ManagedLedgerException.InvalidReplayPositionException) {
+            PositionImpl markDeletePosition = (PositionImpl) cursor.getMarkDeletedPosition();
+            messagesToReplay.removeIf((ledgerId, entryId) -> {
+                return ComparisonChain.start().compare(ledgerId, markDeletePosition.getLedgerId())
+                        .compare(entryId, markDeletePosition.getEntryId()).result() <= 0;
+            });
+        }
+    }
+
+    readBatchSize = serviceConfig.getDispatcherMinReadBatchSize();
+    // 重试读更多消息
+    topic.getBrokerService().executor().schedule(() -> {
+        synchronized (PersistentDispatcherMultipleConsumers.this) {
+            if (!havePendingRead) {
+                log.info("[{}] Retrying read operation", name);
+                readMoreEntries();
+            } else {
+                log.info("[{}] Skipping read retry: havePendingRead {}", name, havePendingRead, exception);
+            }
+        }
+    }, waitTimeMillis, TimeUnit.MILLISECONDS);
+
+}
+
+// 单活消费者实现
+
+public void consumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+    topic.getBrokerService().getTopicOrderedExecutor().executeOrdered(topicName, SafeRun.safeRun(() -> {
+        internalConsumerFlow(consumer, additionalNumberOfMessages);
+    }));
+}
+
+private synchronized void internalConsumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+    // 如果正在读，则忽略本次调用
+    if (havePendingRead) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Ignoring flow control message since we already have a pending read req", name,
+                    consumer);
+        }
+        // 如果原先消费者不是本次消费者，则忽略本次调用
+    } else if (ACTIVE_CONSUMER_UPDATER.get(this) != consumer) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Ignoring flow control message since consumer is not active partition consumer", name,
+                    consumer);
+        }
+        // 如果活消息读任务不为空，则忽略本次调用
+    } else if (readOnActiveConsumerTask != null) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Ignoring flow control message since consumer is waiting for cursor to be rewinded",
+                    name, consumer);
+        }
+    } else {
+        // 触发本次读消息调用
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Trigger new read after receiving flow control message", name, consumer);
+        }
+        readMoreEntries(consumer);
+    }
+}
+
+protected void readMoreEntries(Consumer consumer) {
+    // 当所有的消费者与 broker 断开连接时，消费者为空，故如果当前没有存活消费者时，跳过本地读消息调用
+    if (null == consumer) {
+        return;
+    }
+
+    int availablePermits = consumer.getAvailablePermits();
+
+    if (availablePermits > 0) {
+        if (!consumer.isWritable()) {
+            // 如果当前连接不可写，无论如何还是发读请求，但仅读取一个消息，这里的目的是继续使用这请求作为通知机制，同时避免读取和分派大量的消息，
+            // 这些消息在写入套接字之前需要等待。
+            availablePermits = 1;
+        }
+
+        int messagesToRead = Math.min(availablePermits, readBatchSize);
+        // 这段跟上个实现基本一致
+        if (serviceConfig.isDispatchThrottlingOnNonBacklogConsumerEnabled() || !cursor.isActive()) {
+            if (topic.getDispatchRateLimiter().isPresent()
+                    && topic.getDispatchRateLimiter().get().isDispatchRateLimitingEnabled()) {
+                DispatchRateLimiter topicRateLimiter = topic.getDispatchRateLimiter().get();
+                if (!topicRateLimiter.hasMessageDispatchPermit()) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}] message-read exceeded topic message-rate {}/{}, schedule after a {}", name,
+                            topicRateLimiter.getDispatchRateOnMsg(), topicRateLimiter.getDispatchRateOnByte(),
+                            MESSAGE_RATE_BACKOFF_MS);
+                    }
+                    topic.getBrokerService().executor().schedule(() -> {
+                        // 这里获取到消费者
+                        Consumer currentConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+                        if (currentConsumer != null && !havePendingRead) {
+                            readMoreEntries(currentConsumer);
+                        } else {
+                            if (log.isDebugEnabled()) {
+                                log.debug("[{}] Skipping read retry for topic: Current Consumer {}, havePendingRead {}",
+                                    topic.getName(), currentConsumer, havePendingRead);
+                            }
+                        }
+                    }, MESSAGE_RATE_BACKOFF_MS, TimeUnit.MILLISECONDS);
+                    return;
+                } else {
+                    long availablePermitsOnMsg = topicRateLimiter.getAvailableDispatchRateLimitOnMsg();
+                    if (availablePermitsOnMsg > 0) {
+                        messagesToRead = Math.min(messagesToRead, (int) availablePermitsOnMsg);
+                    }
+                }
+            }
+
+            if (dispatchRateLimiter.isPresent() && dispatchRateLimiter.get().isDispatchRateLimitingEnabled()) {
+                if (!dispatchRateLimiter.get().hasMessageDispatchPermit()) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}] message-read exceeded subscription message-rate {}/{}, schedule after a {}", name,
+                            dispatchRateLimiter.get().getDispatchRateOnMsg(), dispatchRateLimiter.get().getDispatchRateOnByte(),
+                            MESSAGE_RATE_BACKOFF_MS);
+                    }
+                    topic.getBrokerService().executor().schedule(() -> {
+                        Consumer currentConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+                        if (currentConsumer != null && !havePendingRead) {
+                            readMoreEntries(currentConsumer);
+                        } else {
+                            if (log.isDebugEnabled()) {
+                                log.debug("[{}] Skipping read retry: Current Consumer {}, havePendingRead {}",
+                                    topic.getName(), currentConsumer, havePendingRead);
+                            }
+                        }
+                    }, MESSAGE_RATE_BACKOFF_MS, TimeUnit.MILLISECONDS);
+                    return;
+                } else {
+                    long subPermitsOnMsg = dispatchRateLimiter.get().getAvailableDispatchRateLimitOnMsg();
+                    if (subPermitsOnMsg > 0) {
+                        messagesToRead = Math.min(messagesToRead, (int) subPermitsOnMsg);
+                    }
+                }
+            }
+        }
+
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Schedule read of {} messages", name, consumer, messagesToRead);
+        }
+        havePendingRead = true;
+        // 注意，这里区分了压缩读（最主要的区别之一）
+        if (consumer.readCompacted()) {
+            topic.compactedTopic.asyncReadEntriesOrWait(cursor, messagesToRead, this, consumer);
+        } else {
+            cursor.asyncReadEntriesOrWait(messagesToRead, this, consumer);
+        }
+    } else {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Consumer buffer is full, pause reading", name, consumer);
+        }
+    }
+}
+
+// 消息读取成功，执行方法
+public void readEntriesComplete(final List<Entry> entries, Object obj) {
+    topic.getBrokerService().getTopicOrderedExecutor().executeOrdered(topicName, SafeRun.safeRun(() -> {
+        internalReadEntriesComplete(entries, obj);
+    }));
+}
+
+public synchronized void internalReadEntriesComplete(final List<Entry> entries, Object obj) {
+    Consumer readConsumer = (Consumer) obj;
+    if (log.isDebugEnabled()) {
+        log.debug("[{}-{}] Got messages: {}", name, readConsumer, entries.size());
+    }
+    
+    havePendingRead = false;
+
+    if (readBatchSize < serviceConfig.getDispatcherMaxReadBatchSize()) {
+        int newReadBatchSize = Math.min(readBatchSize * 2, serviceConfig.getDispatcherMaxReadBatchSize());
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Increasing read batch size from {} to {}", name, readConsumer, readBatchSize,
+                    newReadBatchSize);
+        }
+
+        readBatchSize = newReadBatchSize;
+    }
+
+    readFailureBackoff.reduceToHalf();
+    // 获取当前唯一活的消费者
+    Consumer currentConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+    // 如果当前消费者为 null 或者 与读取消息之前设置的消费者不一样
+    if (currentConsumer == null || readConsumer != currentConsumer) {
+        // 自发出读取请求以来，活动消费者已发生变更。 此时，需要倒回游标并重新发出新消费者的读取请求
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] rewind because no available consumer found", name);
+        }
+        entries.forEach(Entry::release);
+        cursor.rewind();
+        if (currentConsumer != null) {
+            // 通知消费者已变更
+            notifyActiveConsumerChanged(currentConsumer);
+            readMoreEntries(currentConsumer);
+        }
+    } else {
+        // 这里发送消息
+        currentConsumer.sendMessages(entries, (future, sentMsgInfo) -> {
+            if (future.isSuccess()) {
+                // 与上文一样，不再说明
+                if (serviceConfig.isDispatchThrottlingOnNonBacklogConsumerEnabled() || !cursor.isActive()) {
+                    if (topic.getDispatchRateLimiter().isPresent()) {
+                        topic.getDispatchRateLimiter().get().tryDispatchPermit(sentMsgInfo.getTotalSentMessages(),
+                                sentMsgInfo.getTotalSentMessageBytes());
+                    }
+
+                    if (dispatchRateLimiter.isPresent()) {
+                        dispatchRateLimiter.get().tryDispatchPermit(sentMsgInfo.getTotalSentMessages(),
+                                sentMsgInfo.getTotalSentMessageBytes());
+                    }
+                }
+
+                // 仅在将上一批次数据写入套接字后才进行新的批量消息读取操作
+                topic.getBrokerService().getTopicOrderedExecutor().executeOrdered(topicName, SafeRun.safeRun(() -> {
+                    synchronized (PersistentDispatcherSingleActiveConsumer.this) {
+                        Consumer newConsumer = getActiveConsumer();
+                        if (newConsumer != null && !havePendingRead) {
+                            readMoreEntries(newConsumer);
+                        } else {
+                            if (log.isDebugEnabled()) {
+                                log.debug(
+                                        "[{}-{}] Ignoring write future complete. consumerAvailable={} havePendingRead={}",
+                                        name, newConsumer, newConsumer != null, havePendingRead);
+                            }
+                        }
+                    }
+                }));
+            }
+        });
+    }
+}
+
+// 批量读取消息失败回调
+public void readEntriesFailed(ManagedLedgerException exception, Object ctx) {
+    topic.getBrokerService().getTopicOrderedExecutor().executeOrdered(topicName, SafeRun.safeRun(() -> {
+        internalReadEntriesFailed(exception, ctx);
+    }));
+}
+
+private synchronized void internalReadEntriesFailed(ManagedLedgerException exception, Object ctx) {
+    havePendingRead = false;
+    Consumer c = (Consumer) ctx;
+
+    long waitTimeMillis = readFailureBackoff.next();
+
+    if (exception instanceof NoMoreEntriesToReadException) {
+        if (cursor.getNumberOfEntriesInBacklog() == 0) {
+            // topic 已被终止，没有更多消息可读取，仅在已确认所有消息时才通知消费者
+            consumers.forEach(Consumer::reachedEndOfTopic);
+        }
+    } else if (!(exception instanceof TooManyRequestsException)) {
+        // 读取异常
+        log.error("[{}-{}] Error reading entries at {} : {} - Retrying to read in {} seconds", name, c,
+                cursor.getReadPosition(), exception.getMessage(), waitTimeMillis / 1000.0);
+    } else {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Got throttled by bookies while reading at {} : {} - Retrying to read in {} seconds",
+                    name, c, cursor.getReadPosition(), exception.getMessage(), waitTimeMillis / 1000.0);
+        }
+    }
+    // 消费者非空判断
+    checkNotNull(c);
+
+    readBatchSize = serviceConfig.getDispatcherMinReadBatchSize();
+
+    topic.getBrokerService().executor().schedule(() -> {
+
+        topic.getBrokerService().getTopicOrderedExecutor().executeOrdered(topicName, SafeRun.safeRun(() -> {
+            synchronized (PersistentDispatcherSingleActiveConsumer.this) {
+                Consumer currentConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+                // 如果有一个活动的消费者并且没有正读取消息操作，此时应该尝试读取消息
+                if (currentConsumer != null && !havePendingRead) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[{}-{}] Retrying read operation", name, c);
+                    }
+                    if (currentConsumer != c) {
+                        notifyActiveConsumerChanged(currentConsumer);
+                    }
+                    readMoreEntries(currentConsumer);
+                } else {
+                    log.info("[{}-{}] Skipping read retry: Current Consumer {}, havePendingRead {}", name, c,
+                            currentConsumer, havePendingRead);
+                }
+            }
+        }));
+    }, waitTimeMillis, TimeUnit.MILLISECONDS);
+
+}
+
+// ============================= 非持久化订阅对应的实现==============================
+
+//单活消费者非持久化分发器实现
+public void consumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+    // No-op
+}
+
+//多活消费者非持久化分发器实现
+public synchronized void consumerFlow(Consumer consumer, int additionalNumberOfMessages) {
+    // 查看当前消费者是否在消费者集中
+    if (!consumerSet.contains(consumer)) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Ignoring flow control from disconnected consumer {}", name, consumer);
+        }
+        return;
+    }
+    // 增加最大可用许可
+    TOTAL_AVAILABLE_PERMITS_UPDATER.addAndGet(this, additionalNumberOfMessages);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Trigger new read after receiving flow control message", consumer);
+    }
+}
+
+```
+
+流控命令实现还是较为简单。为了兼容多种订阅模式，实现了4种组合：非持久化单活消费者，非持久化多活消费者，持久化单活消费者，持久化多活消费者。
+下面就梳理下命令实现流程：
+
+1. 未确认消息时，是否应该阻塞消费者
+2. 如果非阻塞，则增加消息许可，并调用订阅流控方法，否则增加当消费者阻塞时，增加消息许可
+3. 如果消费者是持久化类型订阅，且仅有单活消费者，则执行 PersistentDispatcherSingleActiveConsumer 类中 consumerFlow 方法：
+   1. 判断是否是单活消费者，并忽略部分调用。
+   2. 执行 Topic 、 订阅级别的限流
+   3. 如果消费者是压缩读，则直接在 `compactedTopic` 中异步读或等待，否则，消费者直接从游标中异步读取消息或等待。
+   4. 如果从游标中读取消息成功，则
+       1. 调整批量读消息大小
+       2. 调整读取消息失败时批量大小减半
+       3. 如果当前消费者为空或者不等于消息读取之前的消费者，则重置游标，重新用当前消费者去读取消息，否则，发送（推送）消息给客户端的消费者。
+       4. 尝试用本次发送消息数、发送字节数更新 Topic 、订阅级别的分发限制器
+   5. 如果读取失败，则获取读取失败等待时间，异常处理，并延时发布一个读取消息任务。
+4. 如果消费者是持久化订阅，但支持多活订阅，则执行 PersistentDispatcherMultipleConsumers 类中 consumerFlow 方法：
+   1. 检查当前消费者是否是消费者集合中的
+   2. 新增总可用许可数
+   3. 如果总可用许可数大于0并至少有一个消费者可用，则执行 Topic 、 订阅级别的限流
+   4. 如果消息回放池不为空，从其中读取 position 信息，
 
 ### 6. Broker admin 接口实现
 
