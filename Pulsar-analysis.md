@@ -12387,6 +12387,556 @@ public synchronized void consumerFlow(Consumer consumer, int additionalNumberOfM
    3. 如果总可用许可数大于0并至少有一个消费者可用，则执行 Topic 、 订阅级别的限流
    4. 如果消息回放池不为空，从其中读取 position 信息，
 
+
+#### 5. handleAck 命令实现
+
+```java
+
+protected void handleAck(CommandAck ack) {
+    // 状态校验
+    checkArgument(state == State.Connected);
+    CompletableFuture<Consumer> consumerFuture = consumers.get(ack.getConsumerId());
+    // 如果创建消费者完成正常
+    if (consumerFuture != null && consumerFuture.isDone() && !consumerFuture.isCompletedExceptionally()) {
+        consumerFuture.getNow(null).messageAcked(ack);
+    }
+}
+
+// 消息确认
+void messageAcked(CommandAck ack) {
+    Map<String,Long> properties = Collections.emptyMap();
+    if (ack.getPropertiesCount() > 0) {
+        properties = ack.getPropertiesList().stream()
+            .collect(Collectors.toMap((e) -> e.getKey(),
+                                      (e) -> e.getValue()));
+    }
+    // 确认类型为累计确认（简单的说就是，一个消息 Position 就可以确认之前所有的消息）
+    if (ack.getAckType() == AckType.Cumulative) {
+        if (ack.getMessageIdCount() != 1) {
+            log.warn("[{}] [{}] Received multi-message ack at {} - Reason: {}", subscription, consumerId);
+            return;
+        }
+
+        if (subType == SubType.Shared) {
+            log.warn("[{}] [{}] Received cumulative ack on shared subscription, ignoring", subscription, consumerId);
+            return;
+        }
+
+        MessageIdData msgId = ack.getMessageId(0);
+        PositionImpl position = PositionImpl.get(msgId.getLedgerId(), msgId.getEntryId());
+        subscription.acknowledgeMessage(Collections.singletonList(position), AckType.Cumulative, properties);
+    } else {
+        // 确认类型为单个确认 （这里支持跨位确认，假设有1-10个消息，可以先确认第3个，再确认1-2）
+        List<Position> positionsAcked = new ArrayList<>();
+        for (int i = 0; i < ack.getMessageIdCount(); i++) {
+            MessageIdData msgId = ack.getMessageId(i);
+            PositionImpl position = PositionImpl.get(msgId.getLedgerId(), msgId.getEntryId());
+            positionsAcked.add(position);
+
+            if (subType == SubType.Shared) {
+                removePendingAcks(position);
+            }
+
+            if (ack.hasValidationError()) {
+                log.error("[{}] [{}] Received ack for corrupted message at {} - Reason: {}", subscription,
+                        consumerId, position, ack.getValidationError());
+            }
+        }
+        subscription.acknowledgeMessage(positionsAcked, AckType.Individual, properties);
+    }
+}
+
+
+// ==================== 持久化确认 ====================
+
+public void acknowledgeMessage(List<Position> positions, AckType ackType, Map<String,Long> properties) {
+    // 累计确认
+    if (ackType == AckType.Cumulative) {
+        if (positions.size() != 1) {
+            log.warn("[{}][{}] Invalid cumulative ack received with multiple message ids", topicName, subName);
+            return;
+        }
+
+        Position position = positions.get(0);
+        if (log.isDebugEnabled()) {
+            log.debug("[{}][{}] Cumulative ack on {}", topicName, subName, position);
+        }
+        cursor.asyncMarkDelete(position, properties, markDeleteCallback, position);
+    } else {
+        // 单个确认
+        if (log.isDebugEnabled()) {
+            log.debug("[{}][{}] Individual acks on {}", topicName, subName, positions);
+        }
+        // 异步删除消息
+        cursor.asyncDelete(positions, deleteCallback, positions);
+        // 这里是消息重传跟踪器，跟踪消息重传次数
+        dispatcher.getRedeliveryTracker().removeBatch(positions);
+    }
+    // 如果 Topic 已经关闭并且积压队列中无消息，则通知消费者 Topic 已达到底部
+    if (topic.getManagedLedger().isTerminated() && cursor.getNumberOfEntriesInBacklog() == 0) {
+         dispatcher.getConsumers().forEach(Consumer::reachedEndOfTopic);
+    }
+}
+
+
+public void asyncMarkDelete(final Position position, Map<String, Long> properties,
+        final MarkDeleteCallback callback, final Object ctx) {
+    checkNotNull(position);
+    checkArgument(position instanceof PositionImpl);
+    // 检查游标是否关闭
+    if (isClosed()) {
+        callback.markDeleteFailed(new ManagedLedgerException("Cursor was already closed"), ctx);
+        return;
+    }
+    // 判断游标是否正在重置，如果在，则直接返回
+    if (RESET_CURSOR_IN_PROGRESS_UPDATER.get(this) == TRUE) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] cursor reset in progress - ignoring mark delete on position [{}] for cursor [{}]",
+                    ledger.getName(), position, name);
+        }
+        callback.markDeleteFailed(
+                new ManagedLedgerException("Reset cursor in progress - unable to mark delete position "
+                        + ((PositionImpl) position).toString()),
+                ctx);
+    }
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Mark delete cursor {} up to position: {}", ledger.getName(), name, position);
+    }
+    PositionImpl newPosition = (PositionImpl) position;
+    // 如果最后确认消息 position 小于 当前 position，则直接返回，表示不合法 position
+    if (((PositionImpl) ledger.getLastConfirmedEntry()).compareTo(newPosition) < 0) {
+        if (log.isDebugEnabled()) {
+            log.debug(
+                    "[{}] Failed mark delete due to invalid markDelete {} is ahead of last-confirmed-entry {} for cursor [{}]",
+                    ledger.getName(), position, ledger.getLastConfirmedEntry(), name);
+        }
+        callback.markDeleteFailed(new ManagedLedgerException("Invalid mark deleted position"), ctx);
+        return;
+    }
+
+    lock.writeLock().lock();
+    try {
+        // 根据当前新的 position，来确认标记删除 position，读 position
+        newPosition = setAcknowledgedPosition(newPosition);
+    } catch (IllegalArgumentException e) {
+        callback.markDeleteFailed(getManagedLedgerException(e), ctx);
+        return;
+    } finally {
+        lock.writeLock().unlock();
+    }
+
+    // 应用限制标记删除操作（如果没有拿到许可，重置最后标记删除实体，并直接执行回调并返回）
+    if (markDeleteLimiter != null && !markDeleteLimiter.tryAcquire()) {
+        lastMarkDeleteEntry = new MarkDeleteEntry(newPosition, properties, null, null);
+        callback.markDeleteComplete(ctx);
+        return;
+    }
+    internalAsyncMarkDelete(newPosition, properties, callback, ctx);
+}
+
+// 设置确认 position
+PositionImpl setAcknowledgedPosition(PositionImpl newMarkDeletePosition) {
+    // 如果新的标记删除 position 小于 原标记删除 position，则抛异常
+    if (newMarkDeletePosition.compareTo(markDeletePosition) < 0) {
+        throw new IllegalArgumentException("Mark deleting an already mark-deleted position");
+    }
+    
+    PositionImpl oldMarkDeletePosition = markDeletePosition;
+    // 这里不等于，实际上就是大于了
+    if (!newMarkDeletePosition.equals(oldMarkDeletePosition)) {
+        long skippedEntries = 0;
+        // 判断是不是相邻的
+        if (newMarkDeletePosition.getLedgerId() == oldMarkDeletePosition.getLedgerId()
+                && newMarkDeletePosition.getEntryId() == oldMarkDeletePosition.getEntryId() + 1) {
+            // 如果单个消息确认集合中有此消息，则跳过计数
+            skippedEntries = individualDeletedMessages.contains(newMarkDeletePosition) ? 0 : 1;
+        } else {
+            // 计算跳过的消息个数，该方法签名章节已分析，这里跳过
+            skippedEntries = getNumberOfEntries(Range.openClosed(oldMarkDeletePosition, newMarkDeletePosition));
+        }
+        // 找出新标记删除 position 后可用 position
+        PositionImpl positionAfterNewMarkDelete = ledger.getNextValidPosition(newMarkDeletePosition);
+        // 如果新的可用 position 已经在单个消息确认集合中
+        if (individualDeletedMessages.contains(positionAfterNewMarkDelete)) {
+            // 确定新的可用 position 在哪个范围内
+            Range<PositionImpl> rangeToBeMarkDeleted = individualDeletedMessages
+                    .rangeContaining(positionAfterNewMarkDelete);
+            //返回范围内最大的 position 
+            newMarkDeletePosition = rangeToBeMarkDeleted.uppeEndpoint();
+        }
+
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Moved ack position from: {} to: {} -- skipped: {}", ledger.getName(),
+                    oldMarkDeletePosition, newMarkDeletePosition, skippedEntries);
+        }
+        // 统计已消费消息总数
+        messagesConsumedCounter += skippedEntries;
+    }
+
+    // 标记删除 position ，清除那些已删除（已确认）的消息
+    markDeletePosition = PositionImpl.get(newMarkDeletePosition);
+    individualDeletedMessages.remove(Range.atMost(markDeletePosition));
+    // 如果读 position 小于等于新的标记删除 position，意味着客户端已经跳过一些消息，则重新计算移动到新的读 position
+    if (readPosition.compareTo(newMarkDeletePosition) <= 0) {
+        PositionImpl oldReadPosition = readPosition;
+        readPosition = ledger.getNextValidPosition(newMarkDeletePosition);
+
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Moved read position from: {} to: {}, and new mark-delete position {}", ledger.getName(),
+                    oldReadPosition, readPosition, markDeletePosition);
+        }
+    }
+
+    return newMarkDeletePosition;
+}
+
+// 内部异步标记删除操作
+protected void internalAsyncMarkDelete(final PositionImpl newPosition, Map<String, Long> properties,
+        final MarkDeleteCallback callback, final Object ctx) {
+    ledger.mbean.addMarkDeleteOp();
+
+    MarkDeleteEntry mdEntry = new MarkDeleteEntry(newPosition, properties, callback, ctx);
+
+    // 无法在切换期间写入 ledger，需要等到新的元数据 ledger 可用
+    synchronized (pendingMarkDeleteOps) {
+        // 在等待队列互斥时，状态可能已经改变
+        switch (STATE_UPDATER.get(this)) {
+        case Closed:
+            callback.markDeleteFailed(new ManagedLedgerException("Cursor was already closed"), ctx);
+            return;
+
+        case NoLedger:
+            // 需要创建新 ledger 写入（这里前面章节已经分析过，不再重复）
+            startCreatingNewMetadataLedger();
+            // ledger 切换中，需要把当前操作放入等待队列
+        case SwitchingLedger:
+            pendingMarkDeleteOps.add(mdEntry);
+            break;
+
+        case Open:
+            if (PENDING_READ_OPS_UPDATER.get(this) > 0) {
+                // 等待直到没有读操作发生才进行下一个操作
+                pendingMarkDeleteOps.add(mdEntry);
+            } else {
+                // 立即执行标记删除
+                internalMarkDelete(mdEntry);
+            }
+            break;
+
+        default:
+            log.error("[{}][{}] Invalid cursor state: {}", ledger.getName(), name, state);
+            callback.markDeleteFailed(new ManagedLedgerException("Cursor was in invalid state: " + state), ctx);
+            break;
+        }
+    }
+}
+
+void internalMarkDelete(final MarkDeleteEntry mdEntry) {
+    // 该计数器用于标记提交给BK且尚未完成的所有待处理标记删除请求。
+    // 当有未完成的请求，无法关闭当前 ledger，故当计数器变为0时，切换到新 ledger 会被推迟。
+    PENDING_MARK_DELETED_SUBMITTED_COUNT_UPDATER.incrementAndGet(this);
+
+    lastMarkDeleteEntry = mdEntry;
+    // 保存 position 信息到 ledger，前面章节有分析，这里不再赘述
+    persistPositionToLedger(cursorLedger, mdEntry, new VoidCallback() {
+        @Override
+        public void operationComplete() {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Mark delete cursor {} to position {} succeeded", ledger.getName(), name,
+                        mdEntry.newPosition);
+            }
+
+            // 这新的标记删除 position 之前所有对应的 position，都将在单个删除消息池中移除
+            // （简单的说，只要保存成功新的 position，在单个删除消息池中所有小于这个 position 都将移除）
+            lock.writeLock().lock();
+            try {
+                individualDeletedMessages.remove(Range.atMost(mdEntry.newPosition));
+            } finally {
+                lock.writeLock().unlock();
+            }
+            // 更新游标
+            ledger.updateCursor(ManagedCursorImpl.this, mdEntry.newPosition);
+            
+            decrementPendingMarkDeleteCount();
+
+            // 在触发 switchin-ledger 操作后才触发最终回调。 这将确保在下一个标记删除和切换操作之间不会发生竞态条件。
+            if (mdEntry.callbackGroup != null) {
+                // 触发组里每个请求的回调
+                for (MarkDeleteEntry e : mdEntry.callbackGroup) {
+                    e.callback.markDeleteComplete(e.ctx);
+                }
+            } else {
+                // 仅触发当前请求的回调
+                mdEntry.callback.markDeleteComplete(mdEntry.ctx);
+            }
+        }
+        
+        // 保存失败，执行一些标记删除失败操作。
+        @Override
+        public void operationFailed(ManagedLedgerException exception) {
+            log.warn("[{}] Failed to mark delete position for cursor={} position={}", ledger.getName(),
+                    ManagedCursorImpl.this, mdEntry.newPosition);
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Consumer {} cursor mark delete failed with counters: consumed {} mdPos {} rdPos {}",
+                        ledger.getName(), name, messagesConsumedCounter, markDeletePosition, readPosition);
+            }
+
+            decrementPendingMarkDeleteCount();
+
+            if (mdEntry.callbackGroup != null) {
+                for (MarkDeleteEntry e : mdEntry.callbackGroup) {
+                    e.callback.markDeleteFailed(exception, e.ctx);
+                }
+            } else {
+                mdEntry.callback.markDeleteFailed(exception, mdEntry.ctx);
+            }
+        }
+    });
+}
+
+// 递减计数，当计数为0时，判定当前状态是否是正切换 ledger 状态，如果是，则创建新元数据 ledger
+void decrementPendingMarkDeleteCount() {
+    if (PENDING_MARK_DELETED_SUBMITTED_COUNT_UPDATER.decrementAndGet(this) == 0) {
+        final State state = STATE_UPDATER.get(this);
+        if (state == State.SwitchingLedger) {
+            createNewMetadataLedger();
+        }
+    }
+}
+
+// 更新游标
+void updateCursor(ManagedCursorImpl cursor, PositionImpl newPosition) {
+    Pair<PositionImpl, PositionImpl> pair = cursors.cursorUpdated(cursor, newPosition);
+    if (pair == null) {
+        // 此时，游标已经被移除，则检查是否已有消费完的ledger，并且删除
+        trimConsumedLedgersInBackground();
+        return;
+    }
+
+    PositionImpl previousSlowestReader = pair.getLeft();
+    PositionImpl currentSlowestReader = pair.getRight();
+    
+    // 最慢消费者没有变更，则直接返回
+    if (previousSlowestReader.compareTo(currentSlowestReader) == 0) {
+        return;
+    }
+
+    // 仅当 ledger 进行切换时，才进行垃圾回收 
+    if (previousSlowestReader.getLedgerId() != newPosition.getLedgerId()) {
+        trimConsumedLedgersInBackground();
+    }
+}
+
+// 游标更新，并返回更新之前最慢消费者和更新之后最慢消费者
+public Pair<PositionImpl, PositionImpl> cursorUpdated(ManagedCursor cursor, Position newPosition) {
+    checkNotNull(cursor);
+
+    long stamp = rwLock.writeLock();
+    try {
+        Item item = cursors.get(cursor.getName());
+        if (item == null) {
+            return null;
+        }
+
+        PositionImpl previousSlowestConsumer = heap.get(0).position;
+
+        // 当游标向前移动时，需要将其推向树的底部，如果重置完成则将其向上推
+
+        item.position = (PositionImpl) newPosition;
+        if (item.idx == 0 || getParent(item).position.compareTo(item.position) <= 0) {
+            siftDown(item);
+        } else {
+            siftUp(item);
+        }
+
+        PositionImpl newSlowestConsumer = heap.get(0).position;
+        return Pair.of(previousSlowestConsumer, newSlowestConsumer);
+    } finally {
+        rwLock.unlockWrite(stamp);
+    }
+}
+
+void startCreatingNewMetadataLedger() {
+    // 尝试改变 ledger 状态，如果之前状态为正切换，则返回
+    State oldState = STATE_UPDATER.getAndSet(this, State.SwitchingLedger);
+    if (oldState == State.SwitchingLedger) {
+         return;
+    }
+
+    // 如果正标记删除提交计数为0，则立即创建元数据 ledger
+    if (PENDING_MARK_DELETED_SUBMITTED_COUNT_UPDATER.get(this) == 0) {
+        createNewMetadataLedger();
+    }
+}
+
+void createNewMetadataLedger() {
+    createNewMetadataLedger(new VoidCallback() {
+        @Override
+        public void operationComplete() {
+            // 当成功创建后，开始执行队列中的请求
+            synchronized (pendingMarkDeleteOps) {
+                flushPendingMarkDeletes();
+
+                // 恢复正常状态
+                STATE_UPDATER.set(ManagedCursorImpl.this, State.Open);
+            }
+        }
+
+        @Override
+        public void operationFailed(ManagedLedgerException exception) {
+            log.error("[{}][{}] Metadata ledger creation failed", ledger.getName(), name, exception);
+
+            synchronized (pendingMarkDeleteOps) {
+                // 把等待队列的请求全部置为失败
+                while (!pendingMarkDeleteOps.isEmpty()) {
+                    MarkDeleteEntry entry = pendingMarkDeleteOps.poll();
+                    entry.callback.markDeleteFailed(exception, entry.ctx);
+                }
+
+                // 创建失败，置为没有 ledger 状态
+                STATE_UPDATER.set(ManagedCursorImpl.this, State.NoLedger);
+            }
+        }
+    });
+}
+
+private void flushPendingMarkDeletes() {
+    if (!pendingMarkDeleteOps.isEmpty()) {
+        internalFlushPendingMarkDeletes();
+    }
+}
+
+void internalFlushPendingMarkDeletes() {
+    // 拉取最后一个标记删除操作，把剩下来的请求组成一个组
+    MarkDeleteEntry lastEntry = pendingMarkDeleteOps.getLast();
+    lastEntry.callbackGroup = Lists.newArrayList(pendingMarkDeleteOps);
+    pendingMarkDeleteOps.clear();
+    // 执行，前面已分析此方法
+    internalMarkDelete(lastEntry);
+}
+
+// 异步删除
+public void asyncDelete(Iterable<Position> positions, AsyncCallbacks.DeleteCallback callback, Object ctx) {
+    if (isClosed()) {
+        callback.deleteFailed(new ManagedLedgerException("Cursor was already closed"), ctx);
+        return;
+    }
+
+    PositionImpl newMarkDeletePosition = null;
+
+    lock.writeLock().lock();
+
+    try {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] [{}] Deleting individual messages at {}. Current status: {} - md-position: {}",
+                    ledger.getName(), name, positions, individualDeletedMessages, markDeletePosition);
+        }
+
+        for (Position pos : positions) {
+            PositionImpl position  = (PositionImpl) checkNotNull(pos);
+            // position 不能大于 最后确认 position，否则直接返回
+            if (((PositionImpl) ledger.getLastConfirmedEntry()).compareTo(position) < 0) {
+                if (log.isDebugEnabled()) {
+                    log.debug(
+                            "[{}] Failed mark delete due to invalid markDelete {} is ahead of last-confirmed-entry {} for cursor [{}]",
+                            ledger.getName(), position, ledger.getLastConfirmedEntry(), name);
+                }
+                callback.deleteFailed(new ManagedLedgerException("Invalid mark deleted position"), ctx);
+                return;
+            }
+            // 如果已经包含在单个消息确认集合中或小于当前标记删除 position，则跳过
+            if (individualDeletedMessages.contains(position) || position.compareTo(markDeletePosition) <= 0) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}] [{}] Position was already deleted {}", ledger.getName(), name, position);
+                }
+                continue;
+            }
+
+            // 取当前消息前一个消息，组成一个开闭集 (prev, pos]
+            PositionImpl previousPosition = ledger.getPreviousPosition(position);
+            // 把开闭集放入单个消息确认集合中
+            individualDeletedMessages.add(Range.openClosed(previousPosition, position));
+            // 增加已消费计数
+            ++messagesConsumedCounter;
+
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] [{}] Individually deleted messages: {}", ledger.getName(), name,
+                        individualDeletedMessages);
+            }
+        }
+        // 如果单个消息确认集合为空（即无变更数据），则直接回调完成并返回
+        if (individualDeletedMessages.isEmpty()) {
+            callback.deleteComplete(ctx);
+            return;
+        }
+
+        // 如果区间的下限是当前标记删除位置，那么我们可以触发新的标记删除到第一个区间段的上限（因为只有第一个区间删除消息是安全的）
+        Range<PositionImpl> range = individualDeletedMessages.asRanges().iterator().next();
+
+        // 如果区间的下限小于等于标记删除的 position 或者 标记删除的 position 与 区间的下限之间消息数为 0 
+        if (range.lowerEndpoint().compareTo(markDeletePosition) <= 0 || ledger
+                .getNumberOfEntries(Range.openClosed(markDeletePosition, range.lowerEndpoint())) <= 0) {
+
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Found a position range to mark delete for cursor {}: {} ", ledger.getName(),
+                        name, range);
+            }
+            // 那么调整新的标记删除 position 为区间的上限
+            newMarkDeletePosition = range.upperEndpoint();
+        }
+        // 重新设置
+        if (newMarkDeletePosition != null) {
+            newMarkDeletePosition = setAcknowledgedPosition(newMarkDeletePosition);
+        } else {
+            newMarkDeletePosition = markDeletePosition;
+        }
+    } catch (Exception e) {
+        log.warn("[{}] [{}] Error while updating individualDeletedMessages [{}]", ledger.getName(), name,
+                e.getMessage(), e);
+        callback.deleteFailed(getManagedLedgerException(e), ctx);
+        return;
+    } finally {
+        lock.writeLock().unlock();
+    }
+
+    // 应用标记删除限流
+    if (markDeleteLimiter != null && !markDeleteLimiter.tryAcquire()) {
+        lastMarkDeleteEntry = new MarkDeleteEntry(newMarkDeletePosition, Collections.emptyMap(), null, null);
+        callback.deleteComplete(ctx);
+        return;
+    }
+
+    try {
+        // 异步调用标记删除
+        internalAsyncMarkDelete(newMarkDeletePosition, Collections.emptyMap(), new MarkDeleteCallback() {
+            @Override
+            public void markDeleteComplete(Object ctx) {
+                callback.deleteComplete(ctx);
+            }
+
+            @Override
+            public void markDeleteFailed(ManagedLedgerException exception, Object ctx) {
+                callback.deleteFailed(exception, ctx);
+            }
+
+        }, ctx);
+
+    } catch (Exception e) {
+        log.warn("[{}] [{}] Error doing asyncDelete [{}]", ledger.getName(), name, e.getMessage(), e);
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Consumer {} cursor asyncDelete error, counters: consumed {} mdPos {} rdPos {}",
+                    ledger.getName(), name, messagesConsumedCounter, markDeletePosition, readPosition);
+        }
+        callback.deleteFailed(new ManagedLedgerException(e), ctx);
+    }
+}
+
+// ==================== 压缩持久化确认 ====================
+
+// ==================== 非持久化确认 ====================
+```
+
 ### 6. Broker admin 接口实现
 
 ## 4. Pulsar Proxy 解析
