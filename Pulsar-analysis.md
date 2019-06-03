@@ -11544,6 +11544,278 @@ private PersistentSubscription createPersistentSubscription(String subscriptionN
     }
 }
 
+// 往持久化订阅增加消费者
+public synchronized void addConsumer(Consumer consumer) throws BrokerServiceException {
+    // 更新游标最新访问时间（即最后活动时间）
+    cursor.updateLastActive();
+    // 状态判断，如果订阅已关闭，则抛异常
+    if (IS_FENCED_UPDATER.get(this) == TRUE) {
+        log.warn("Attempting to add consumer {} on a fenced subscription", consumer);
+        throw new SubscriptionFencedException("Subscription is fenced");
+    }
+    // 如果分发器为空 或者 分发器暂无活动消费者
+    if (dispatcher == null || !dispatcher.isConsumerConnected()) {
+        switch (consumer.subType()) {
+        case Exclusive:
+            // 独占模式
+            if (dispatcher == null || dispatcher.getType() != SubType.Exclusive) {
+                dispatcher = new PersistentDispatcherSingleActiveConsumer(cursor, SubType.Exclusive, 0, topic);
+            }
+            break;
+        case Shared:
+            // 共享模式
+            if (dispatcher == null || dispatcher.getType() != SubType.Shared) {
+                dispatcher = new PersistentDispatcherMultipleConsumers(topic, cursor);
+            }
+            break;
+        case Failover:
+            //故障转移模式
+            int partitionIndex = TopicName.getPartitionIndex(topicName);
+            if (partitionIndex < 0) {
+                // For non partition topics, assume index 0 to pick a predictable consumer
+                partitionIndex = 0;
+            }
+
+            if (dispatcher == null || dispatcher.getType() != SubType.Failover) {
+                dispatcher = new PersistentDispatcherSingleActiveConsumer(cursor, SubType.Failover, partitionIndex,
+                        topic);
+            }
+            break;
+        default:
+            throw new ServerMetadataException("Unsupported subscription type");
+        }
+    } else {
+        if (consumer.subType() != dispatcher.getType()) {
+            throw new SubscriptionBusyException("Subscription is of different type");
+        }
+    }
+
+    dispatcher.addConsumer(consumer);
+}
+
+// AbstractDispatcherSingleActiveConsumer 构造方法
+public AbstractDispatcherSingleActiveConsumer(SubType subscriptionType, int partitionIndex,
+        String topicName) {
+    this.topicName = topicName;
+    this.consumers = new CopyOnWriteArrayList<>();
+    this.partitionIndex = partitionIndex;
+    this.subscriptionType = subscriptionType;
+    ACTIVE_CONSUMER_UPDATER.set(this, null);
+}
+
+// 单活消费者实现
+// 单活构造方法
+public PersistentDispatcherSingleActiveConsumer(ManagedCursor cursor, SubType subscriptionType, int partitionIndex,
+        PersistentTopic topic) {
+    super(subscriptionType, partitionIndex, topic.getName());
+    this.topic = topic;
+    this.name = topic.getName() + " / " + (cursor.getName() != null ? Codec.decode(cursor.getName())
+            : ""/* NonDurableCursor 没有名字*/);
+    this.cursor = cursor;
+    this.serviceConfig = topic.getBrokerService().pulsar().getConfiguration();
+    this.readBatchSize = serviceConfig.getDispatcherMaxReadBatchSize();
+    // 重发跟踪器是被禁用的
+    this.redeliveryTracker = RedeliveryTrackerDisabled.REDELIVERY_TRACKER_DISABLED;
+    this.initializeDispatchRateLimiterIfNeeded(Optional.empty());
+}
+
+public synchronized void addConsumer(Consumer consumer) throws BrokerServiceException {
+    // 状态检查
+    if (IS_CLOSED_UPDATER.get(this) == TRUE) {
+        log.warn("[{}] Dispatcher is already closed. Closing consumer ", this.topicName, consumer);
+        consumer.disconnect();
+    }
+    // 独占模式下，已有消费者，则抛异常
+    if (subscriptionType == SubType.Exclusive && !consumers.isEmpty()) {
+        throw new ConsumerBusyException("Exclusive consumer is already connected");
+    }
+    // topic 对消费者数限制
+    if (isConsumersExceededOnTopic()) {
+        log.warn("[{}] Attempting to add consumer to topic which reached max consumers limit", this.topicName);
+        throw new ConsumerBusyException("Topic reached max consumers limit");
+    }
+    // 每个订阅对消费者数限制
+    if (subscriptionType == SubType.Failover && isConsumersExceededOnSubscription()) {
+        log.warn("[{}] Attempting to add consumer to subscription which reached max consumers limit", this.topicName);
+        throw new ConsumerBusyException("Subscription reached max consumers limit");
+    }
+
+    consumers.add(consumer);
+
+    if (!pickAndScheduleActiveConsumer()) {
+        // the active consumer is not changed
+        Consumer currentActiveConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+        if (null == currentActiveConsumer) {
+            if (log.isDebugEnabled()) {
+                log.debug("Current active consumer disappears while adding consumer {}", consumer);
+            }
+        } else {
+            consumer.notifyActiveConsumerChange(currentActiveConsumer);
+        }
+    }
+
+}
+// topic 消费者人数配额限制
+protected boolean isConsumersExceededOnTopic() {
+    Policies policies;
+    try {
+        policies = topic.getBrokerService().pulsar().getConfigurationCache().policiesCache()
+                .get(AdminResource.path(POLICIES, TopicName.get(topicName).getNamespace()))
+                .orElseGet(() -> new Policies());
+    } catch (Exception e) {
+        policies = new Policies();
+    }
+    final int maxConsumersPerTopic = policies.max_consumers_per_topic > 0 ?
+            policies.max_consumers_per_topic :
+            serviceConfig.getMaxConsumersPerTopic();
+    if (maxConsumersPerTopic > 0 && maxConsumersPerTopic <= topic.getNumberOfConsumers()) {
+        return true;
+    }
+    return false;
+}
+
+// 订阅中最大消费者配额限制
+protected boolean isConsumersExceededOnSubscription() {
+    Policies policies;
+    try {
+        policies = topic.getBrokerService().pulsar().getConfigurationCache().policiesCache()
+                .get(AdminResource.path(POLICIES, TopicName.get(topicName).getNamespace()))
+                .orElseGet(() -> new Policies());
+    } catch (Exception e) {
+        policies = new Policies();
+    }
+    final int maxConsumersPerSubscription = policies.max_consumers_per_subscription > 0 ?
+            policies.max_consumers_per_subscription :
+            serviceConfig.getMaxConsumersPerSubscription();
+    if (maxConsumersPerSubscription > 0 && maxConsumersPerSubscription <= consumers.size()) {
+        return true;
+    }
+    return false;
+}
+
+protected boolean pickAndScheduleActiveConsumer() {
+    // 不能为空
+    checkArgument(!consumers.isEmpty());
+    // 根据消费者名字排序
+    consumers.sort((c1, c2) -> c1.consumerName().compareTo(c2.consumerName()));
+    // 确定消费者
+    int index = partitionIndex % consumers.size();
+    // 保存原消费者
+    Consumer prevConsumer = ACTIVE_CONSUMER_UPDATER.getAndSet(this, consumers.get(index));
+    // 获取设置的消费者
+    Consumer activeConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+    if (prevConsumer == activeConsumer) {
+        // 如果活的消费者没有变化，则返回 false
+        return false;
+    } else {
+        // 如果活的消费者已经变革，则发送通知
+        scheduleReadOnActiveConsumer();
+        return true;
+    }
+}
+
+protected void scheduleReadOnActiveConsumer() {
+    // 取消正读请求
+    if (havePendingRead && cursor.cancelPendingReadRequest()) {
+        havePendingRead = false;
+    }
+    // 如果取消失败，则返回
+    if (havePendingRead) {
+        return;
+    }
+
+    // 当新的消费者被选中，从未确认消息中开始重发，如果有任何正读取操作，让它完成并且重置
+    // 当订阅类型不是故障转移 或者 故障转移延迟时间小于等于 0,执行操作
+    if (subscriptionType != SubType.Failover || serviceConfig.getActiveConsumerFailoverDelayTimeMillis() <= 0) {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Rewind cursor and read more entries without delay", name);
+        }
+        cursor.rewind();
+
+        Consumer activeConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+        // 通知活的消费者变更
+        notifyActiveConsumerChanged(activeConsumer);
+        // 读取更多消息
+        readMoreEntries(activeConsumer);
+        return;
+    }
+
+    // 如果订阅类型为故障转移，延迟配置时间间隔重置游标和读取消息，避免消息重复
+    if (readOnActiveConsumerTask != null) {
+        return;
+    }
+
+    readOnActiveConsumerTask = topic.getBrokerService().executor().schedule(() -> {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Rewind cursor and read more entries after {} ms delay", name,
+                    serviceConfig.getActiveConsumerFailoverDelayTimeMillis());
+        }
+        cursor.rewind();
+
+        Consumer activeConsumer = ACTIVE_CONSUMER_UPDATER.get(this);
+        notifyActiveConsumerChanged(activeConsumer);
+        readMoreEntries(activeConsumer);
+        readOnActiveConsumerTask = null;
+    }, serviceConfig.getActiveConsumerFailoverDelayTimeMillis(), TimeUnit.MILLISECONDS);
+}
+
+// 多个消费者实现
+// 多活构造方法
+public PersistentDispatcherMultipleConsumers(PersistentTopic topic, ManagedCursor cursor) {
+    this.serviceConfig = topic.getBrokerService().pulsar().getConfiguration();
+    this.cursor = cursor;
+    this.name = topic.getName() + " / " + Codec.decode(cursor.getName());
+    this.topic = topic;
+    // 消息重放集合
+    this.messagesToReplay = new ConcurrentLongPairSet(512, 2);
+    // 根据配置来决定是否启用内存重发跟踪器
+    this.redeliveryTracker = this.serviceConfig.isSubscriptionRedeliveryTrackerEnabled()
+            ? new InMemoryRedeliveryTracker()
+            : RedeliveryTrackerDisabled.REDELIVERY_TRACKER_DISABLED;
+    this.readBatchSize = serviceConfig.getDispatcherMaxReadBatchSize();
+    // 这里初始化最大未确认消息
+    this.maxUnackedMessages = topic.getBrokerService().pulsar().getConfiguration()
+            .getMaxUnackedMessagesPerSubscription();
+    this.initializeDispatchRateLimiterIfNeeded(Optional.empty());
+}
+
+
+public synchronized void addConsumer(Consumer consumer) throws BrokerServiceException {
+    if (IS_CLOSED_UPDATER.get(this) == TRUE) {
+        log.warn("[{}] Dispatcher is already closed. Closing consumer ", name, consumer);
+        consumer.disconnect();
+        return;
+    }
+    // 当前消费者列表为空
+    if (consumerList.isEmpty()) {
+        if (havePendingRead || havePendingReplayRead) {
+            // 如果有正（回放）读取消息已经在运行，必须等到它们完成后才能转回游标，此标志为true
+            shouldRewindBeforeReadingOrReplaying = true;
+        } else {
+            cursor.rewind();
+            shouldRewindBeforeReadingOrReplaying = false;
+        }
+        // 这里清空消息回放池
+        messagesToReplay.clear();
+    }
+
+    if (isConsumersExceededOnTopic()) {
+        log.warn("[{}] Attempting to add consumer to topic which reached max consumers limit", name);
+        throw new ConsumerBusyException("Topic reached max consumers limit");
+    }
+
+    if (isConsumersExceededOnSubscription()) {
+        log.warn("[{}] Attempting to add consumer to subscription which reached max consumers limit", name);
+        throw new ConsumerBusyException("Subscription reached max consumers limit");
+    }
+
+    consumerList.add(consumer);
+    // 按照优先级排序
+    consumerList.sort((c1, c2) -> c1.getPriorityLevel() - c2.getPriorityLevel());
+    consumerSet.add(consumer);
+}
+
+
 // ============================ 非持久化订阅 ===================================
 
 private CompletableFuture<? extends Subscription> getNonDurableSubscription(String subscriptionName, MessageId startMessageId) {
@@ -11636,6 +11908,74 @@ private void recoverCursor(PositionImpl mdPosition) {
     messagesConsumedCounter = lastEntryAndCounter.getRight() - initialBacklog;
 }
 
+// 把消费者加入到非持久化订阅中
+public synchronized void addConsumer(Consumer consumer) throws BrokerServiceException {
+    if (IS_FENCED_UPDATER.get(this) == TRUE) {
+        log.warn("Attempting to add consumer {} on a fenced subscription", consumer);
+        throw new SubscriptionFencedException("Subscription is fenced");
+    }
+
+    if (dispatcher == null || !dispatcher.isConsumerConnected()) {
+        switch (consumer.subType()) {
+        case Exclusive:
+            if (dispatcher == null || dispatcher.getType() != SubType.Exclusive) {
+                dispatcher = new NonPersistentDispatcherSingleActiveConsumer(SubType.Exclusive, 0, topic, this);
+            }
+            break;
+        case Shared:
+            if (dispatcher == null || dispatcher.getType() != SubType.Shared) {
+                dispatcher = new NonPersistentDispatcherMultipleConsumers(topic, this);
+            }
+            break;
+        case Failover:
+            int partitionIndex = TopicName.getPartitionIndex(topicName);
+            if (partitionIndex < 0) {
+                partitionIndex = 0;
+            }
+
+            if (dispatcher == null || dispatcher.getType() != SubType.Failover) {
+                dispatcher = new NonPersistentDispatcherSingleActiveConsumer(SubType.Failover, partitionIndex,
+                        topic, this);
+            }
+            break;
+        default:
+            throw new ServerMetadataException("Unsupported subscription type");
+        }
+    } else {
+        if (consumer.subType() != dispatcher.getType()) {
+            throw new SubscriptionBusyException("Subscription is of different type");
+        }
+    }
+
+    dispatcher.addConsumer(consumer);
+}
+
+
+// 单活消费者，与持久化订阅一样
+
+// 多活消费者
+// 与持久化订阅基本上类似
+public synchronized void addConsumer(Consumer consumer) throws BrokerServiceException {
+    if (IS_CLOSED_UPDATER.get(this) == TRUE) {
+        log.warn("[{}] Dispatcher is already closed. Closing consumer ", name, consumer);
+        consumer.disconnect();
+        return;
+    }
+
+    if (isConsumersExceededOnTopic()) {
+        log.warn("[{}] Attempting to add consumer to topic which reached max consumers limit", name);
+        throw new ConsumerBusyException("Topic reached max consumers limit");
+    }
+
+    if (isConsumersExceededOnSubscription()) {
+        log.warn("[{}] Attempting to add consumer to subscription which reached max consumers limit", name);
+        throw new ConsumerBusyException("Subscription reached max consumers limit");
+    }
+
+    consumerList.add(consumer);
+    consumerSet.add(consumer);
+}
+
 ```
 
 自此，订阅接口已经完毕，下面，总结下流程：
@@ -11660,7 +12000,7 @@ private void recoverCursor(PositionImpl mdPosition) {
    
    1. 创建一般的持久化订阅
 
-7. 创建消费者
+7. 创建消费者，并把消费者新增到订阅
 8. 尝试用新创建的消费者执行完成,如果成功，则发送订阅成功，否则关闭消费者。
 
 #### 4. newFlow 实现
@@ -12934,8 +13274,429 @@ public void asyncDelete(Iterable<Position> positions, AsyncCallbacks.DeleteCallb
 
 // ==================== 压缩持久化确认 ====================
 
+// 跟压缩持久化订阅类似，压缩持久化
+public void acknowledgeMessage(List<Position> positions, AckType ackType, Map<String,Long> properties) {
+    // 必须累计确认
+    checkArgument(ackType == AckType.Cumulative);
+    // position 集合必须只能有一个
+    checkArgument(positions.size() == 1);
+    // 属性KEY必须包含 CompactedTopicLedger 标志
+    checkArgument(properties.containsKey(Compactor.COMPACTED_TOPIC_LEDGER_PROPERTY));
+    // 取出对应的压缩后的 ledger
+    long compactedLedgerId = properties.get(Compactor.COMPACTED_TOPIC_LEDGER_PROPERTY);
+
+    Position position = positions.get(0);
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}][{}] Cumulative ack on compactor subscription {}", topicName, subName, position);
+    }
+    CompletableFuture<Void> future = new CompletableFuture<>();
+    // 异步确认
+    cursor.asyncMarkDelete(position, properties, new MarkDeleteCallback() {
+            @Override
+            public void markDeleteComplete(Object ctx) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}][{}] Mark deleted messages until position on compactor subscription {}",
+                              topicName, subName, position);
+                }
+                future.complete(null);
+            }
+
+            @Override
+            public void markDeleteFailed(ManagedLedgerException exception, Object ctx) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[{}][{}] Failed to mark delete for position on compactor subscription {}",
+                              topicName, subName, ctx, exception);
+                }
+            }
+        }, null);
+
+    if (topic.getManagedLedger().isTerminated() && cursor.getNumberOfEntriesInBacklog() == 0) {
+        dispatcher.getConsumers().forEach(Consumer::reachedEndOfTopic);
+    }
+
+    // 一旦属性被保存后，通知压缩 topic 用新的 ledger。
+    future.thenAccept((v) -> compactedTopic.newCompactedLedger(position, compactedLedgerId));
+}
+
+public CompletableFuture<?> newCompactedLedger(Position p, long compactedLedgerId) {
+    synchronized (this) {
+        compactionHorizon = (PositionImpl)p;
+
+        CompletableFuture<CompactedTopicContext> previousContext = compactedTopicContext;
+        // 尝试打开 ledger
+        compactedTopicContext = openCompactedLedger(bk, compactedLedgerId);
+
+        // 一旦新的 ledger创建成功，则删除上下文中的老 ledger
+        if (previousContext != null) {
+            return compactedTopicContext.thenCompose((res) -> previousContext)
+                .thenCompose((res) -> tryDeleteCompactedLedger(bk, res.ledger.getId()));
+        } else {
+            return compactedTopicContext;
+        }
+    }
+}
+
+private static CompletableFuture<CompactedTopicContext> openCompactedLedger(BookKeeper bk, long id) {
+    CompletableFuture<LedgerHandle> promise = new CompletableFuture<>();
+    bk.asyncOpenLedger(id,
+                       Compactor.COMPACTED_TOPIC_LEDGER_DIGEST_TYPE,
+                       Compactor.COMPACTED_TOPIC_LEDGER_PASSWORD,
+                       (rc, ledger, ctx) -> {
+                           if (rc != BKException.Code.OK) {
+                               promise.completeExceptionally(BKException.create(rc));
+                           } else {
+                               promise.complete(ledger);
+                           }
+                       }, null);
+    return promise.thenApply((ledger) -> new CompactedTopicContext(
+                                     ledger, createCache(ledger, DEFAULT_STARTPOINT_CACHE_SIZE)));
+}
+
+private static CompletableFuture<Void> tryDeleteCompactedLedger(BookKeeper bk, long id) {
+    CompletableFuture<Void> promise = new CompletableFuture<>();
+    bk.asyncDeleteLedger(id,
+                         (rc, ctx) -> {
+                             if (rc != BKException.Code.OK) {
+                                 log.warn("Error deleting compacted topic ledger {}",
+                                          id, BKException.create(rc));
+                             } else {
+                                 log.debug("Compacted topic ledger deleted successfully");
+                             }
+                             promise.complete(null); // don't propagate any error
+                         }, null);
+    return promise;
+}
+
+
 // ==================== 非持久化确认 ====================
+
+// 空实现
+public void acknowledgeMessage(List<Position> position, AckType ackType, Map<String, Long> properties) {
+    // No-op
+}
 ```
+
+
+#### 6. handleRedeliverUnacknowledged 命令实现
+
+```java
+
+
+protected void handleRedeliverUnacknowledged(CommandRedeliverUnacknowledgedMessages redeliver) {
+    checkArgument(state == State.Connected);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Received Resend Command from consumer {} ", remoteAddress, redeliver.getConsumerId());
+    }
+
+    CompletableFuture<Consumer> consumerFuture = consumers.get(redeliver.getConsumerId());
+
+    if (consumerFuture != null && consumerFuture.isDone() && !consumerFuture.isCompletedExceptionally()) {
+        Consumer consumer = consumerFuture.getNow(null);
+        if (redeliver.getMessageIdsCount() > 0 && consumer.subType() == SubType.Shared) {
+            consumer.redeliverUnacknowledgedMessages(redeliver.getMessageIdsList());
+        } else {
+            consumer.redeliverUnacknowledgedMessages();
+        }
+    }
+}
+
+//  如果参数中消息ID总数大于0并且消费者子类型为共享类型，则执行如下：
+
+public void redeliverUnacknowledgedMessages(List<MessageIdData> messageIds) {
+
+    int totalRedeliveryMessages = 0;
+    List<PositionImpl> pendingPositions = Lists.newArrayList();
+    // 统计每个消息重发次数
+    for (MessageIdData msg : messageIds) {
+        PositionImpl position = PositionImpl.get(msg.getLedgerId(), msg.getEntryId());
+        LongPair batchSize = pendingAcks.get(position.getLedgerId(), position.getEntryId());
+        if (batchSize != null) {
+            pendingAcks.remove(position.getLedgerId(), position.getEntryId());
+            totalRedeliveryMessages += batchSize.first;
+            pendingPositions.add(position);
+        }
+    }
+    // 增加未确认消息数
+    addAndGetUnAckedMsgs(this, -totalRedeliveryMessages);
+    // 未确认消息阻塞消费者
+    blockedConsumerOnUnackedMsgs = false;
+
+    if (log.isDebugEnabled()) {
+        log.debug("[{}-{}] consumer {} received {} msg-redelivery {}", topicName, subscription, consumerId,
+                totalRedeliveryMessages, pendingPositions.size());
+    }
+
+    subscription.redeliverUnacknowledgedMessages(this, pendingPositions);
+    // 记录多事件
+    msgRedeliver.recordMultipleEvents(totalRedeliveryMessages, totalRedeliveryMessages);
+    // 当消费者阻塞时，接收到的许可数，这里置为0（这里阻塞是因为子订阅为共享类型并且未确认消息数已达到最大未确认数时候，
+    // 并不会立即推送消息给客户端，而是等符合条件才推送，具体参考 flowPermits 方法）
+    int numberOfBlockedPermits = PERMITS_RECEIVED_WHILE_CONSUMER_BLOCKED_UPDATER.getAndSet(this, 0);
+
+    // 如果许可计数大于0，则加上许可，并开始推送消息给客户端
+    if (numberOfBlockedPermits > 0) {
+        MESSAGE_PERMITS_UPDATER.getAndAdd(this, numberOfBlockedPermits);
+        // 这里就是执行流控命令，上面章节详细分析
+        subscription.consumerFlow(this, numberOfBlockedPermits);
+    }
+}
+
+private int addAndGetUnAckedMsgs(Consumer consumer, int ackedMessages) {
+    subscription.addUnAckedMessages(ackedMessages);
+    return UNACKED_MESSAGES_UPDATER.addAndGet(consumer, ackedMessages);
+}
+
+public void addUnAckedMessages(int unAckMessages) {
+    dispatcher.addUnAckedMessages(unAckMessages);
+}
+
+//============================= 持久化 - 未确认消息重发 ======
+
+public synchronized void redeliverUnacknowledgedMessages(Consumer consumer, List<PositionImpl> positions) {
+    dispatcher.redeliverUnacknowledgedMessages(consumer, positions);
+}
+
+// 单活消费者处理
+
+public void addUnAckedMessages(int unAckMessages) {
+    // No-op
+}
+
+public void redeliverUnacknowledgedMessages(Consumer consumer, List<PositionImpl> positions) {
+    // 无法保证单个消费者重发消息保持（原消息）顺序，这里是统计消息的重发次数
+    positions.forEach(redeliveryTracker::incrementAndGetRedeliveryCount);
+    redeliverUnacknowledgedMessages(consumer);
+}
+
+public void redeliverUnacknowledgedMessages(Consumer consumer) {
+    topic.getBrokerService().getTopicOrderedExecutor().executeOrdered(topicName, SafeRun.safeRun(() -> {
+        internalRedeliverUnacknowledgedMessages(consumer);
+    }));
+}
+
+private synchronized void internalRedeliverUnacknowledgedMessages(Consumer consumer) {
+    if (consumer != ACTIVE_CONSUMER_UPDATER.get(this)) {
+        log.info("[{}-{}] Ignoring reDeliverUnAcknowledgedMessages: Only the active consumer can call resend",
+                name, consumer);
+        return;
+    }
+
+    if (readOnActiveConsumerTask != null) {
+        log.info("[{}-{}] Ignoring reDeliverUnAcknowledgedMessages: consumer is waiting for cursor to be rewinded",
+                name, consumer);
+        return;
+    }
+    // 这里进行判断，如果正在读，但是游标已经取消正在读请求，则置为 false
+    if (havePendingRead && cursor.cancelPendingReadRequest()) {
+        havePendingRead = false;
+    }
+    // 如果没有正在读的请求，则发起读
+    if (!havePendingRead) {
+        cursor.rewind();
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Cursor rewinded, redelivering unacknowledged messages. ", name, consumer);
+        }
+        // 前面已解析，这里不再重复
+        readMoreEntries(consumer);
+    } else {
+        log.info("[{}-{}] Ignoring reDeliverUnAcknowledgedMessages: cancelPendingRequest on cursor failed", name,
+                consumer);
+    }
+
+}
+
+// 多活消费者处理
+
+// 增加未确认消息数
+public void addUnAckedMessages(int numberOfMessages) {
+    // 如果 最大未确认消息数（maxUnackedMessages） 等于 0，则直接返回
+    if (maxUnackedMessages <= 0) {
+        return;
+    }
+    // 当前未确认消息总数
+    int unAckedMessages = TOTAL_UNACKED_MESSAGES_UPDATER.addAndGet(this, numberOfMessages);
+    if (unAckedMessages >= maxUnackedMessages
+            && BLOCKED_DISPATCHER_ON_UNACKMSG_UPDATER.compareAndSet(this, FALSE, TRUE)) {
+        // 如果到达最大未确认消息限制，则阻塞分发器
+        log.info("[{}] Dispatcher is blocked due to unackMessages {} reached to max {}", name,
+                TOTAL_UNACKED_MESSAGES_UPDATER.get(this), maxUnackedMessages);
+    } else if (topic.getBrokerService().isBrokerDispatchingBlocked()
+            && blockedDispatcherOnUnackedMsgs == TRUE) {
+        // 恢复分发器：如果分发器被阻塞是因为 broker 级别未确认消息数达到限制。如果已确认足够多的消息
+        if (totalUnackedMessages < (topic.getBrokerService().maxUnackedMsgsPerDispatcher / 2)) {
+            if (BLOCKED_DISPATCHER_ON_UNACKMSG_UPDATER.compareAndSet(this, TRUE, FALSE)) {
+                // 这将分发器从阻塞列表移除，恢复分发器轮询读操作
+                topic.getBrokerService().unblockDispatchersOnUnAckMessages(Lists.newArrayList(this));
+            }
+        }
+    } else if (blockedDispatcherOnUnackedMsgs == TRUE && unAckedMessages < maxUnackedMessages / 2) {
+        // 恢复（当前）分发器，如果已确认足够多的消息。此时开始读取消息
+        if (BLOCKED_DISPATCHER_ON_UNACKMSG_UPDATER.compareAndSet(this, TRUE, FALSE)) {
+            log.info("[{}] Dispatcher is unblocked", name);
+            topic.getBrokerService().executor().execute(() -> readMoreEntries());
+        }
+    }
+    // 增加 broker 级别总数
+    topic.getBrokerService().addUnAckedMessages(this, numberOfMessages);
+}
+
+public void unblockDispatchersOnUnAckMessages(List<PersistentDispatcherMultipleConsumers> dispatcherList) {
+    lock.writeLock().lock();
+    try {
+        // 把当前的分发器恢复，并开始读取消息，并从阻塞的分发器列表移除
+        dispatcherList.forEach(dispatcher -> {
+            dispatcher.unBlockDispatcherOnUnackedMsgs();
+            executor().execute(() -> dispatcher.readMoreEntries());
+            log.info("[{}] Dispatcher is unblocked", dispatcher.getName());
+            blockedDispatchers.remove(dispatcher);
+        });
+    } finally {
+        lock.writeLock().unlock();
+    }
+}
+
+public void addUnAckedMessages(PersistentDispatcherMultipleConsumers dispatcher, int numberOfMessages) {
+    // 如果 最大未确认消息数（maxUnackedMessages） 等于 0，则直接返回
+    if (maxUnackedMessages > 0) {
+        totalUnackedMessages.add(numberOfMessages);
+
+        // 阻塞分发器：如果 broker 已经被阻塞和当 broker 被阻塞时，分发器达到最大分发限制
+        if (blockedDispatcherOnHighUnackedMsgs.get() && !dispatcher.isBlockedDispatcherOnUnackedMsgs()
+                && dispatcher.getTotalUnackedMessages() > maxUnackedMsgsPerDispatcher) {
+            lock.readLock().lock();
+            try {
+                log.info("[{}] dispatcher reached to max unack msg limit on blocked-broker {}",
+                        dispatcher.getName(), dispatcher.getTotalUnackedMessages());
+                // 因为未确认消息阻塞分发器
+                dispatcher.blockDispatcherOnUnackedMsgs();
+                // 加入阻塞列表
+                blockedDispatchers.add(dispatcher);
+            } finally {
+                lock.readLock().unlock();
+            }
+        }
+    }
+}
+
+public synchronized void redeliverUnacknowledgedMessages(Consumer consumer, List<PositionImpl> positions) {
+    positions.forEach(position -> {
+        // 记录需要重放的消息
+        messagesToReplay.add(position.getLedgerId(), position.getEntryId());
+        // 记录消息重放次数
+        redeliveryTracker.incrementAndGetRedeliveryCount(position);
+    });
+    if (log.isDebugEnabled()) {
+        log.debug("[{}-{}] Redelivering unacknowledged messages for consumer {}", name, consumer, positions);
+    }
+    // 读更多消息
+    readMoreEntries();
+}
+
+//  非持久化实现为空
+public synchronized void redeliverUnacknowledgedMessages(Consumer consumer, List<PositionImpl> positions) {
+    // No-op
+}
+
+// 这里为消费者没有指定消息ID和子类型不为共享类型（目前即为独占或故障转移类型）
+// =========================================
+
+public void redeliverUnacknowledgedMessages() {
+    // 清除未确认消息桶，再一次重发未确认消息
+    clearUnAckedMsgs(this);
+    blockedConsumerOnUnackedMsgs = false;
+    if (log.isDebugEnabled()) {
+        log.debug("[{}-{}] consumer {} received redelivery", topicName, subscription, consumerId);
+    }
+    // 重发未确认的消息
+    subscription.redeliverUnacknowledgedMessages(this);
+    flowConsumerBlockedPermits(this);
+    // 统计总重发次数，并记录事件，最后清空正确认队列
+    if (pendingAcks != null) {
+        AtomicInteger totalRedeliveryMessages = new AtomicInteger(0);
+        pendingAcks.forEach(
+                (ledgerId, entryId, batchSize, none) -> totalRedeliveryMessages.addAndGet((int) batchSize));
+        msgRedeliver.recordMultipleEvents(totalRedeliveryMessages.get(), totalRedeliveryMessages.get());
+        pendingAcks.clear();
+    }
+}
+
+// 话说这个分支不是共享类型分支，这个方法有作用？
+void flowConsumerBlockedPermits(Consumer consumer) {
+    // 当消费者达到阻塞时，接收到的许可数，这里置为0
+    int additionalNumberOfPermits = PERMITS_RECEIVED_WHILE_CONSUMER_BLOCKED_UPDATER.getAndSet(consumer, 0);
+    // 增加新的流控许可数到实际的消费者消息许可
+    MESSAGE_PERMITS_UPDATER.getAndAdd(consumer, additionalNumberOfPermits);
+    // 分发正处理许可到流控更多消息：它将新增更多的许可到分发器和消费者
+    subscription.consumerFlow(consumer, additionalNumberOfPermits);
+}
+
+private void clearUnAckedMsgs(Consumer consumer) {
+    int unaAckedMsgs = UNACKED_MESSAGES_UPDATER.getAndSet(this, 0);
+    subscription.addUnAckedMessages(-unaAckedMsgs);
+}
+
+public synchronized void redeliverUnacknowledgedMessages(Consumer consumer) {
+    dispatcher.redeliverUnacknowledgedMessages(consumer);
+}
+
+// 多消费者实现
+
+public synchronized void redeliverUnacknowledgedMessages(Consumer consumer) {
+    // 这里注意与接口有消息ID集合的区别
+    consumer.getPendingAcks().forEach((ledgerId, entryId, batchSize, none) -> {
+        messagesToReplay.add(ledgerId, entryId);
+    });
+    if (log.isDebugEnabled()) {
+        log.debug("[{}-{}] Redelivering unacknowledged messages for consumer {}", name, consumer, messagesToReplay);
+    }
+    readMoreEntries();
+}
+
+// 单消费者实现
+public void redeliverUnacknowledgedMessages(Consumer consumer) {
+    topic.getBrokerService().getTopicOrderedExecutor().executeOrdered(topicName, SafeRun.safeRun(() -> {
+        internalRedeliverUnacknowledgedMessages(consumer);
+    }));
+}
+
+private synchronized void internalRedeliverUnacknowledgedMessages(Consumer consumer) {
+    if (consumer != ACTIVE_CONSUMER_UPDATER.get(this)) {
+        log.info("[{}-{}] Ignoring reDeliverUnAcknowledgedMessages: Only the active consumer can call resend",
+                name, consumer);
+        return;
+    }
+
+    if (readOnActiveConsumerTask != null) {
+        log.info("[{}-{}] Ignoring reDeliverUnAcknowledgedMessages: consumer is waiting for cursor to be rewinded",
+                name, consumer);
+        return;
+    }
+
+    if (havePendingRead && cursor.cancelPendingReadRequest()) {
+        havePendingRead = false;
+    }
+
+    if (!havePendingRead) {
+        cursor.rewind();
+        if (log.isDebugEnabled()) {
+            log.debug("[{}-{}] Cursor rewinded, redelivering unacknowledged messages. ", name, consumer);
+        }
+        readMoreEntries(consumer);
+    } else {
+        log.info("[{}-{}] Ignoring reDeliverUnAcknowledgedMessages: cancelPendingRequest on cursor failed", name,
+                consumer);
+    }
+
+}
+
+
+```
+
+对于未确认消息重发，它的主要作用在于“提醒”客户端对消息进行确认，当然最重要还是消息达到一定的重发次数，
+则会把消息丢弃其对应的死信 Topic 中。
+
+#### 7. 
 
 ### 6. Broker admin 接口实现
 
