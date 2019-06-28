@@ -12725,7 +12725,11 @@ public synchronized void consumerFlow(Consumer consumer, int additionalNumberOfM
    1. 检查当前消费者是否是消费者集合中的
    2. 新增总可用许可数
    3. 如果总可用许可数大于0并至少有一个消费者可用，则执行 Topic 、 订阅级别的限流
-   4. 如果消息回放池不为空，从其中读取 position 信息，
+   4. 如果消息回放池不为空，根据可用许可以及消息回放池确定要回放的消息（ID），把得出要回放的消息（ID）尝试从 ledger 读取回放的消息（此时会过滤已被确认的消息），此时已被确认的消息将从
+   消息回放池移除，如果从 ledger 读取消息成功后，将执行回调： 1. 选出一个合适的消费者 2. 把消息推送选出的消费者 3. 尝试用本次发送消息数、发送字节数更新 Topic 、订阅级别的分发限制器 4. 如果
+   消息还没有分发完，则重新放入消息回放池中。如果失败，1. 根据异常来处理不同的返回 2. 定时下一轮重试读取。
+5. 如果消费者是非持久化订阅，且仅有单活消费者，则执行 NonPersistentDispatcherSingleActiveConsumer 类中 consumerFlow 方法：空实现。
+6. 如果消费者是非持久化订阅，但支持多活订阅，则执行 NonPersistentDispatcherMultipleConsumers 类中 consumerFlow 方法：1. 如果不在消费者集中，直接返回。2. 增加可用许可数。
 
 
 #### 5. handleAck 命令实现
@@ -13363,7 +13367,7 @@ private static CompletableFuture<Void> tryDeleteCompactedLedger(BookKeeper bk, l
                              } else {
                                  log.debug("Compacted topic ledger deleted successfully");
                              }
-                             promise.complete(null); // don't propagate any error
+                             promise.complete(null); 
                          }, null);
     return promise;
 }
@@ -13376,6 +13380,46 @@ public void acknowledgeMessage(List<Position> position, AckType ackType, Map<Str
     // No-op
 }
 ```
+
+消息确认是所有现代MQ或IM系统必备的功能，主要功能在于保证消费者在网络抖动、业务、应用异常、主机宕机情况下，
+都能保证消费到，通知 broker 表示已成功消费，可以推送新消息。当然，在某些情况下，某条消息消费多次还是没有确认（即确认超时），
+系统会自动把它放入死信 topic 中。目前流行的MQ，都只有类似于累积确认模式，并没有单个消息确认模式。
+
+具体流程如下：
+
+1. 累积确认
+   1. 累积模式下，只能有一个确认消息
+   2. 累积模式下，订阅类型不能用共享模式
+   3. 持久化订阅时，普通的 Topic 订阅时，调用的 PersistentSubscription 类的 acknowledgeMessage 方法来进行消息确认：
+   
+      1. 游标状态判断
+      2. 游标是否处于重置状态
+      3. 判断当前消息确认 position 是否大于 ledger 对应的最近确认（分布式坏境应该叫提交）消息 position
+      4. 根据当前消息确认 position，计算出标记删除 position 和读 position ，并返回新的标记删除 position
+      5. 标记删除操作可能被限流
+      6. 根据当前游标状态来操作： 1. 已关闭，则抛异常。 2. 无 ledger，则开始创建新的元数据 ledger。 3. 正切换 ledger，则把当前标记删除操作放入等待队列。4. 已打开，如果有正读操作，则放入等待队列，否则立即执行标记删除操作。
+      7. 保存确认 position （包括单个消息确认集合和属性信息）到 cursorLedger，如果成功，则检查是否要关闭 cursorLedger，如果要关闭，则重新创建一个新的元数据 cursorLedger，并执行完成回调。如果失败，则尝试保存在元数据存储（zookkeeper中），此时如果成功，则执行完成回调，否则执行失败回调。
+      8. 接步骤7，如果执行完成回调，则移除已确认消息之前所有的单个消息确认池中的 position，更新游标信息，尝试清理已消费完的 ledger，执行标记删除实例中的回调。如果执行失败回到，则执行标记删除实例中的回调为异常结果。
+      9. 检查 ledger 是否已被删除或禁用以及游标积压队列积压数为0，此时通知所有的消费者 topic 已经达到末尾。
+
+   4. 持久化订阅时，压缩 Topic 订阅，调用的 CompactorSubscription 类的 acknowledgeMessage 方法来进行消息确认：
+
+      1. 检查确认中属性是否包含 `CompactedTopicLedger`,保存游标信息 ledger，此操作跟 PersistentSubscription 类的保存动作完全一致。
+      2. 检查 ledger 是否已被删除或禁用以及游标积压队列积压数为0，此时通知所有的消费者 topic 已经达到末尾。
+      3. 属性被保存后，尝试创建新的 ledger，并删除老的 ledger。
+   5. 非持久化订阅时，无操作。
+
+2. 单个消息确认
+
+   1. 从请求参数中依次读取确认ID，如果订阅类型为共享模式，则尝试从当前消费者 pendingAcks 移除相关的确认 position，如果确认 position 没有出现当前消费者的 pendingAcks 中，则尝试从其他连接此订阅的消费者中删除（当客户端尝试通过同一订阅下的不同消费者确认消息时会发生这种情况）。如果删除成功，则判断当前消费者总未确认数是否小于等于最大未确认数的一半、未确认消息导致阻塞消费者为真以及是否应该阻塞当前消费者为真，如果为真，则设置消费者的阻塞标志为false，且发起流控操作。
+   2. 持久化订阅时，普通的 Topic 订阅时，调用的 PersistentSubscription 类的 acknowledgeMessage 方法来进行消息确认：
+      1. 异步执行游标删除操作，先确定新的标记删除 position ，然后执行标记删除限流操作，最后执行异步标记删除操作。这里跟累计确认异步标记删除过程一样。
+      2. 分发器获取重发跟踪器，移除前面 position 集合。
+   3. 非持久化订阅时，无操作。
+
+
+从这里可以看出，累计确认和单个消息确认最大的区别在于，单个消息确认是创造性的支持交叉错位确认，其主要解决共享模式中多消费者的消息确认问题。
+
 
 
 #### 6. handleRedeliverUnacknowledged 命令实现
@@ -13694,9 +13738,459 @@ private synchronized void internalRedeliverUnacknowledgedMessages(Consumer consu
 ```
 
 对于未确认消息重发，它的主要作用在于“提醒”客户端对消息进行确认，当然最重要还是消息达到一定的重发次数，
-则会把消息丢弃其对应的死信 Topic 中。
+客户端会把消息投递到对应的死信 Topic 中。
 
-#### 7. 
+#### 7. handleUnsubscribe 命令实现
+
+```java
+
+protected void handleUnsubscribe(CommandUnsubscribe unsubscribe) {
+    checkArgument(state == State.Connected);
+
+    CompletableFuture<Consumer> consumerFuture = consumers.get(unsubscribe.getConsumerId());
+
+    if (consumerFuture != null && consumerFuture.isDone() && !consumerFuture.isCompletedExceptionally()) {
+        consumerFuture.getNow(null).doUnsubscribe(unsubscribe.getRequestId());
+    } else {
+        ctx.writeAndFlush(
+                Commands.newError(unsubscribe.getRequestId(), ServerError.MetadataError, "Consumer not found"));
+    }
+}
+
+void doUnsubscribe(final long requestId) {
+    final ChannelHandlerContext ctx = cnx.ctx();
+    // 反订阅
+    subscription.doUnsubscribe(this).thenAccept(v -> {
+        // 执行成功的话，则从连接池移除消费者，并发成功消息给消费者
+        log.info("Unsubscribed successfully from {}", subscription);
+        cnx.removedConsumer(this);
+        ctx.writeAndFlush(Commands.newSuccess(requestId));
+    }).exceptionally(exception -> {
+        log.warn("Unsubscribe failed for {}", subscription, exception);
+        ctx.writeAndFlush(
+                Commands.newError(requestId, BrokerServiceException.getClientErrorCode(exception.getCause()),
+                        exception.getCause().getMessage()));
+        return null;
+    });
+}
+
+public void close() throws BrokerServiceException {
+    subscription.removeConsumer(this);
+    cnx.removedConsumer(this);
+}
+
+public void removedConsumer(Consumer consumer) {
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] Removed consumer: {}", remoteAddress, consumer);
+    }
+
+    consumers.remove(consumer.consumerId());
+}
+
+// PersistentSubscription 类移除消费者
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    cursor.updateLastActive();
+    if (dispatcher != null) {
+        dispatcher.removeConsumer(consumer);
+    }
+    if (dispatcher.getConsumers().isEmpty()) {
+        deactivateCursor();
+
+        if (!cursor.isDurable()) {
+            close();
+            topic.getBrokerService().pulsar().getExecutor().submit(() ->{
+                topic.removeSubscription(subName);
+            });
+        }
+    }
+
+    PersistentTopic.USAGE_COUNT_UPDATER.decrementAndGet(topic);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] [{}] [{}] Removed consumer -- count: {}", topic.getName(), subName, consumer.consumerName(),
+                PersistentTopic.USAGE_COUNT_UPDATER.get(topic));
+    }
+}
+
+// ======================== 持久化订阅 =======================
+
+public CompletableFuture<Void> doUnsubscribe(Consumer consumer) {
+    CompletableFuture<Void> future = new CompletableFuture<>();
+    try {
+        // 检查是否能反订阅
+        if (dispatcher.canUnsubscribe(consumer)) {
+            // broker 端消费者关闭
+            consumer.close();
+            return delete();
+        }
+        future.completeExceptionally(
+                new ServerMetadataException("Unconnected or shared consumer attempting to unsubscribe"));
+    } catch (BrokerServiceException e) {
+        log.warn("Error removing consumer {}", consumer);
+        future.completeExceptionally(e);
+    }
+    return future;
+}
+
+// 单活消费者
+public synchronized boolean canUnsubscribe(Consumer consumer) {
+    // 只有一个消费者，并且当前消费者与活的消费者是同一个
+    return (consumers.size() == 1) && Objects.equals(consumer, ACTIVE_CONSUMER_UPDATER.get(this));
+}
+
+// AbstractDispatcherSingleActiveConsumer 移除消费者
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    log.info("Removing consumer {}", consumer);
+    // 如果没有移除成功，则抛异常
+    if (!consumers.remove(consumer)) {
+        throw new ServerMetadataException("Consumer was not connected");
+    }
+    // 如果当前消费者为空，则置活动消费者为null
+    if (consumers.isEmpty()) {
+        ACTIVE_CONSUMER_UPDATER.set(this, null);
+    }
+    // 不是关闭以及消费者不为空，则尝试切换活动消费者
+    if (closeFuture == null && !consumers.isEmpty()) {
+        pickAndScheduleActiveConsumer();
+        return;
+    }
+    //取消正读操作 
+    cancelPendingRead();
+    if (consumers.isEmpty() && closeFuture != null && !closeFuture.isDone()) {
+        // 只有在创建closeFuture时，控制才会到达此处，意味着没有更多的已连接消费者了。
+        closeFuture.complete(null);
+    }
+}
+
+// 多活消费者
+public synchronized boolean canUnsubscribe(Consumer consumer) {
+    // 只有一个消费者，并且当前消费者在消费者集合中
+    return consumerList.size() == 1 && consumerSet.contains(consumer);
+}
+
+// PersistentDispatcherMultipleConsumers 类移除消费者
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    // 从移除的消费者中减去未确认消息数
+    addUnAckedMessages(-consumer.getUnackedMessages());
+    if (consumerSet.removeAll(consumer) == 1) {
+        consumerList.remove(consumer);
+        log.info("Removed consumer {} with pending {} acks", consumer, consumer.getPendingAcks().size());
+        // 已经无消费者
+        if (consumerList.isEmpty()) {
+            // 停止正常读的请求
+            if (havePendingRead && cursor.cancelPendingReadRequest()) {
+                havePendingRead = false;
+            }
+            // 清空消息回放池
+            messagesToReplay.clear();
+            if (closeFuture != null) {
+                log.info("[{}] All consumers removed. Subscription is disconnected", name);
+                closeFuture.complete(null);
+            }
+            totalAvailablePermits = 0;
+        } else {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}] Consumer are left, reading more entries", name);
+            }
+            // 把消费者未确认消息放进回放池
+            consumer.getPendingAcks().forEach((ledgerId, entryId, batchSize, none) -> {
+                messagesToReplay.add(ledgerId, entryId);
+            });
+            // 减去消费者可用许可
+            totalAvailablePermits -= consumer.getAvailablePermits();
+            readMoreEntries();
+        }
+    } else {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Trying to remove a non-connected consumer: {}", name, consumer);
+        }
+    }
+}
+
+// 移除消费者
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    // 更新游标最后访问时间
+    cursor.updateLastActive();
+    if (dispatcher != null) {
+        dispatcher.removeConsumer(consumer);
+    }
+    if (dispatcher.getConsumers().isEmpty()) {
+        // 如果分发器的消费者为空，则游标为非活动状态
+        deactivateCursor();
+
+        if (!cursor.isDurable()) {
+            // 如果游标是非持久性的，也需要清理订阅信息，这里设置游标状态为已关闭
+            close();
+            // 当 topic 关闭时，并发订阅Map会在迭代过程中关闭每个订阅，又移除 topic 时，会试着访问相同的 map 这可能导致死锁，所以在不同的线程执行它
+            topic.getBrokerService().pulsar().getExecutor().submit(() ->{
+                topic.removeSubscription(subName);
+            });
+        }
+    }
+    // 使用计数递减
+    PersistentTopic.USAGE_COUNT_UPDATER.decrementAndGet(topic);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] [{}] [{}] Removed consumer -- count: {}", topic.getName(), subName, consumer.consumerName(),
+                PersistentTopic.USAGE_COUNT_UPDATER.get(topic));
+    }
+}
+
+public CompletableFuture<Void> delete() {
+    CompletableFuture<Void> deleteFuture = new CompletableFuture<>();
+
+    log.info("[{}][{}] Unsubscribing", topicName, subName);
+
+    // 游标关闭并取消确认操作
+    this.close().thenCompose(v -> topic.unsubscribe(subName)).thenAccept(v -> deleteFuture.complete(null))
+            .exceptionally(exception -> {
+                IS_FENCED_UPDATER.set(this, FALSE);
+                log.error("[{}][{}] Error deleting subscription", topicName, subName, exception);
+                deleteFuture.completeExceptionally(exception);
+                return null;
+            });
+
+    return deleteFuture;
+}
+
+// 尝试关闭
+public CompletableFuture<Void> close() {
+    synchronized (this) {
+        if (dispatcher != null && dispatcher.isConsumerConnected()) {
+            return FutureUtil.failedFuture(new SubscriptionBusyException("Subscription has active consumers"));
+        }
+        IS_FENCED_UPDATER.set(this, TRUE);
+        log.info("[{}][{}] Successfully closed subscription [{}]", topicName, subName, cursor);
+    }
+
+    return CompletableFuture.completedFuture(null);
+}
+
+// 反订阅，从元数据存储库中删除游标信息
+public CompletableFuture<Void> unsubscribe(String subscriptionName) {
+    CompletableFuture<Void> unsubscribeFuture = new CompletableFuture<>();
+
+    ledger.asyncDeleteCursor(Codec.encode(subscriptionName), new DeleteCursorCallback() {
+        @Override
+        public void deleteCursorComplete(Object ctx) {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}][{}] Cursor deleted successfully", topic, subscriptionName);
+            }
+            // 删除成功
+            subscriptions.remove(subscriptionName);
+            unsubscribeFuture.complete(null);
+            lastActive = System.nanoTime();
+        }
+
+        @Override
+        public void deleteCursorFailed(ManagedLedgerException exception, Object ctx) {
+            if (log.isDebugEnabled()) {
+                log.debug("[{}][{}] Error deleting cursor for subscription", topic, subscriptionName, exception);
+            }
+            unsubscribeFuture.completeExceptionally(new PersistenceException(exception));
+        }
+    }, null);
+
+    return unsubscribeFuture;
+}
+
+// ======================== 非持久化订阅 =====================
+
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    if (dispatcher != null) {
+        dispatcher.removeConsumer(consumer);
+    }
+
+    // invalid consumer remove will throw an exception
+    // decrement usage is triggered only for valid consumer close
+    NonPersistentTopic.USAGE_COUNT_UPDATER.decrementAndGet(topic);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] [{}] [{}] Removed consumer -- count: {}", topic.getName(), subName, consumer.consumerName(),
+                NonPersistentTopic.USAGE_COUNT_UPDATER.get(topic));
+    }
+}
+
+public CompletableFuture<Void> doUnsubscribe(Consumer consumer) {
+    CompletableFuture<Void> future = new CompletableFuture<>();
+    try {
+        // 这里判定是否当前消费者是最后一个，如果是的话，关闭消费者，删除
+        if (dispatcher.canUnsubscribe(consumer)) {
+            consumer.close();
+            return delete();
+        }
+        future.completeExceptionally(
+                new ServerMetadataException("Unconnected or shared consumer attempting to unsubscribe"));
+    } catch (BrokerServiceException e) {
+        log.warn("Error removing consumer {}", consumer);
+        future.completeExceptionally(e);
+    }
+    return future;
+}
+
+// 关闭消费者两种情况：1.连接已经被关闭 2.连接是打开的（和平关闭）但是无消息确认
+public void close() throws BrokerServiceException {
+    // 从订阅中移除当前消费者
+    subscription.removeConsumer(this);
+    cnx.removedConsumer(this);
+}
+
+// 从订阅中移除消费者
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    if (dispatcher != null) {
+        dispatcher.removeConsumer(consumer);
+    }
+
+    // 递减使用计数
+    NonPersistentTopic.USAGE_COUNT_UPDATER.decrementAndGet(topic);
+    if (log.isDebugEnabled()) {
+        log.debug("[{}] [{}] [{}] Removed consumer -- count: {}", topic.getName(), subName, consumer.consumerName(),
+                NonPersistentTopic.USAGE_COUNT_UPDATER.get(topic));
+    }
+}
+
+// 多活消费者 NonPersistentDispatcherMultipleConsumers 类
+public synchronized boolean canUnsubscribe(Consumer consumer) {
+    return (consumers.size() == 1) && Objects.equals(consumer, ACTIVE_CONSUMER_UPDATER.get(this));
+}
+
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    if (consumerSet.removeAll(consumer) == 1) {
+        consumerList.remove(consumer);
+        log.info("Removed consumer {}", consumer);
+        // 当前订阅中消费者已经没有，订阅也该关闭
+        if (consumerList.isEmpty()) {
+            if (closeFuture != null) {
+                log.info("[{}] All consumers removed. Subscription is disconnected", name);
+                closeFuture.complete(null);
+            }
+            // 总可用许可数归0
+            TOTAL_AVAILABLE_PERMITS_UPDATER.set(this, 0);
+        }
+    } else {
+        if (log.isDebugEnabled()) {
+            log.debug("[{}] Trying to remove a non-connected consumer: {}", name, consumer);
+        }
+        // 尝试移除一个未连接的消费者，并且减少此消费者的可用许可
+        TOTAL_AVAILABLE_PERMITS_UPDATER.addAndGet(this, -consumer.getAvailablePermits());
+    }
+}
+
+// 单活消费者 AbstractDispatcherSingleActiveConsumer 类
+public synchronized boolean canUnsubscribe(Consumer consumer) {
+    return consumerList.size() == 1 && consumerSet.contains(consumer);
+}
+// 这里持久化订阅一样 也是 AbstractDispatcherSingleActiveConsumer 类
+public synchronized void removeConsumer(Consumer consumer) throws BrokerServiceException {
+    log.info("Removing consumer {}", consumer);
+    if (!consumers.remove(consumer)) {
+        throw new ServerMetadataException("Consumer was not connected");
+    }
+
+    if (consumers.isEmpty()) {
+        ACTIVE_CONSUMER_UPDATER.set(this, null);
+    }
+
+    if (closeFuture == null && !consumers.isEmpty()) {
+        pickAndScheduleActiveConsumer();
+        return;
+    }
+
+    cancelPendingRead();
+
+    if (consumers.isEmpty() && closeFuture != null && !closeFuture.isDone()) {
+        closeFuture.complete(null);
+    }
+}
+
+```
+
+消费者取消订阅，意味着 broker 不再推送消息给消费者。
+
+1. 持久化订阅取消
+
+   1. 如果是单活消费者分发器判断是否能取消订阅：当前消费者为存活消费者，且消费者集合中只有一个消费者。多活消费者时判断：消费者集合包含当前消费者，且只有一个消费者。如果不能取消订阅，则抛异常。
+   2. 从分发器中移除消费者（这里是订阅转发）：
+      1. 如果是单活消费者： 
+          1. 如果消费者集合为空，则置活动消费者为null。如果消费者集合不为空且不处于关闭消费者状态，则根据分区索引来切换活动消费者。
+          2. 果新选出的消费者不等于当前消费者，则取消当前读操作。如果订阅类型不是故障转移或者活消费者故障转移延迟时间小于等于0，则回退游标，通知消费者变更，并且开始使用新的消费者读取消息，返回。
+          3. 如果订阅类型为故障转移，则开启一个定时任务：回退游标，通知消费者变更，并且开始使用新的消费者读取消息。
+          4. 如果消费者集合已经为空，则取消当前读请求。如果消费者为空，关闭future不为空且还没完成，则置关闭futrue为完成。
+      2. 如果是多活消费者： 
+          1. 根据当前移除消费者，减少消费者未确认消息数
+          2. 如果从消费者集合中移除成功之后，如果消费者集合已为空，则取消读请求，清空消息回放池，设置关闭future为已完成，总可用许可置为0，否则把移除消费者未确认的消息全部放入消息回放池，并且减去移除消费者的可以许可数，继续读取更多消息。
+   6. 如果此时分发器中消费者已经为空了， 则把当前游标置为非活动状态，递减持久化 Topic 使用计数。
+   7. 如果分发器不为空并且分发器还有消费者连接，则返回异常。否则置订阅为已关闭。
+   8. 尝试从元数据管理器删除游标信息，如果成功，重试3次，异步删除 ledger 保存的游标信息，从游标集合移除游标信息，并使消息缓存部分失效，后台执行已消费完的 ledger 清理，这里后标记执行成功。否则标记删除游标失败。
+   9. 此时从订阅集合中移除此订阅，标记取消订阅成功。否则，取消订阅失败。
+   10. 如果以上执行成功，从连接池移除消费者，并发送成功命令给消费者，否则把执行错误发给消费者。
+
+2. 非持久化订阅取消
+
+    1. 如果是单活消费者分发器判断是否能取消订阅：当前消费者为存活消费者，且消费者集合中只有一个消费者。多活消费者时判断：消费者集合包含当前消费者，且只有一个消费者，与持久化订阅一致。
+    2. 从分发器中移除消费者（这里是订阅转发）：
+       1. 如果是单活消费者：
+          1. 如果消费者集合为空，则置活动消费者为null。如果消费者集合不为空且不处于关闭消费者状态，则根据分区索引来切换活动消费者。
+          2. 切换活动消费者为空实现。
+       2. 如果是多消费者：
+          1. 如果移除消费者成功，则再次判定消费者集合是否为空，如果是，则置关闭futrue为完成，总可用许可置为0。否则，总可用许可减去移除消费者的可用许可。
+    3. 递减非持久化 Topic 引用计数。
+    4. 从连接池移除当前消费者。
+    5. 置订阅为已关闭，执行完成后，置取消订阅为完成。
+    6. 如果以上执行成功，从连接池移除消费者，并发送成功命令给消费者，否则把执行错误发给消费者。
+
+#### 8. handleCloseConsumer 命令实现
+
+```java
+
+protected void handleCloseConsumer(CommandCloseConsumer closeConsumer) {
+    checkArgument(state == State.Connected);
+    log.info("[{}] Closing consumer: {}", remoteAddress, closeConsumer.getConsumerId());
+
+    long requestId = closeConsumer.getRequestId();
+    long consumerId = closeConsumer.getConsumerId();
+
+    CompletableFuture<Consumer> consumerFuture = consumers.get(consumerId);
+    if (consumerFuture == null) {
+        log.warn("[{}] Consumer was not registered on the connection: {}", consumerId, remoteAddress);
+        ctx.writeAndFlush(Commands.newError(requestId, ServerError.MetadataError, "Consumer not found"));
+        return;
+    }
+
+    if (!consumerFuture.isDone() && consumerFuture
+            .completeExceptionally(new IllegalStateException("Closed consumer before creation was complete"))) {
+        // 在消费者实际完成之前已经收到了关闭消费者的请求，现在将消费者futrue标记为失败，可以告诉客户端关闭操作成功。 当实际创建操作完成时，新的消费者将被丢弃。
+        log.info("[{}] Closed consumer {} before its creation was completed", remoteAddress, consumerId);
+        ctx.writeAndFlush(Commands.newSuccess(requestId));
+        return;
+    }
+    // 消费者本身创建失败，然后就不管，直接应答关闭成功
+    if (consumerFuture.isCompletedExceptionally()) {
+        log.info("[{}] Closed consumer {} that already failed to be created", remoteAddress, consumerId);
+        ctx.writeAndFlush(Commands.newSuccess(requestId));
+        return;
+    }
+
+    // 正常消费者关闭处理
+    Consumer consumer = consumerFuture.getNow(null);
+    try {
+        consumer.close();
+        consumers.remove(consumerId, consumerFuture);
+        ctx.writeAndFlush(Commands.newSuccess(requestId));
+        log.info("[{}] Closed consumer {}", remoteAddress, consumer);
+    } catch (BrokerServiceException e) {
+        log.warn("[{]] Error closing consumer: ", remoteAddress, consumer, e);
+        ctx.writeAndFlush(
+                Commands.newError(requestId, BrokerServiceException.getClientErrorCode(e), e.getMessage()));
+    }
+}
+// 这里取消订阅逻辑中已经分析过了。
+public void close() throws BrokerServiceException {
+    subscription.removeConsumer(this);
+    cnx.removedConsumer(this);
+}
+
+
+```
+
+从这里可以看出，消费者关闭，有很大的一部分跟取消订阅类似，取消订阅多了一个删除游标动作，而关闭消费者则没有。
 
 ### 6. Broker admin 接口实现
 
