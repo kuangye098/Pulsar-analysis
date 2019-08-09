@@ -7,7 +7,7 @@
 1. 剖析 Pulsar 各个模块，了解其架构设计和编码技巧
 
    - [X] pulsar-client
-   - [ ] pulsar-broker
+   - [ ] pulsar-broker（正在新增一些详细说明）
    - [ ] pulsar-proxy
    - [ ] pulsar-functions
    - [ ] pulsar-admin
@@ -29,4 +29,4 @@
 欢迎有兴趣的同学一起来完成这项工作。
 
 QQ群: 763305109
-微信群可以联系QQ群主拉进去。
+微信群：pulsar官方以及源码解析群可以联系QQ群主拉进去。
